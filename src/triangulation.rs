@@ -12,7 +12,7 @@ use crate::Barycentric;
 use crate::DelaunayTriangulation;
 use crate::HintGenerator;
 use crate::{delaunay_core::Dcel, handles::*};
-use crate::{HasPosition, InsertionError, Point2, TriangulationExt};
+use crate::{HasPosition, InsertionError, Point2, QueryError, RemovalError, TriangulationExt};
 
 use alloc::vec::Vec;
 
@@ -343,7 +343,7 @@ pub trait Triangulation: Default {
     /// Get a vertex by its index
     ///
     /// To get the handle, wrap your local index in a FixedVertexHandle:
-    /// `let handle = FixedVertexHandle::from_index(my_index);`
+    /// `let handle = FixedVertexHandle::from_index(my_index)?;`
     #[allow(clippy::type_complexity)]
     fn get_vertex(
         &self,
@@ -417,34 +417,38 @@ pub trait Triangulation: Default {
 
     /// Returns information about the location of a point in a triangulation.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the target point has any `NAN` coordinate.
+    /// Returns [QueryError::NAN] if the target point has any `NAN` coordinate.
     fn locate(
         &self,
         point: Point2<<Self::Vertex as HasPosition>::Scalar>,
-    ) -> PositionInTriangulation {
+    ) -> Result<PositionInTriangulation, QueryError> {
         let hint = self.hint_generator().get_hint(point);
         self.locate_with_hint_option_core(point, Some(hint))
     }
 
     /// Locates a vertex at a given position.
     ///
-    /// Returns `None` if the point could not be found.
+    /// Returns `Ok(None)` if the point could not be found.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the target point has any `NAN` coordinate.
+    /// Returns [QueryError::NAN] if the target point has any `NAN` coordinate.
     #[allow(clippy::type_complexity)]
     fn locate_vertex(
         &self,
         point: Point2<<Self::Vertex as HasPosition>::Scalar>,
-    ) -> Option<VertexHandle<'_, Self::Vertex, Self::DirectedEdge, Self::UndirectedEdge, Self::Face>>
-    {
-        match self.locate(point) {
+    ) -> Result<
+        Option<
+            VertexHandle<'_, Self::Vertex, Self::DirectedEdge, Self::UndirectedEdge, Self::Face>,
+        >,
+        QueryError,
+    > {
+        Ok(match self.locate(point)? {
             PositionInTriangulation::OnVertex(vertex) => Some(self.vertex(vertex)),
             _ => None,
-        }
+        })
     }
 
     /// Returns an edge between two vertices.
@@ -469,16 +473,16 @@ pub trait Triangulation: Default {
     /// The hint should be a vertex close to the position that
     /// is being looked up.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the target vertex has any `NAN` coordinate.
+    /// Returns [QueryError::NAN] if the target point has any `NAN` coordinate.
     ///
     /// *See also [locate](Triangulation::locate), [locate_vertex](Triangulation::locate_vertex)*
     fn locate_with_hint(
         &self,
         point: Point2<<Self::Vertex as HasPosition>::Scalar>,
         hint: FixedVertexHandle,
-    ) -> PositionInTriangulation {
+    ) -> Result<PositionInTriangulation, QueryError> {
         self.locate_with_hint_option_core(point, Some(hint))
     }
 
@@ -501,24 +505,25 @@ pub trait Triangulation: Default {
 
     /// Attempts to remove a vertex from the triangulation.
     ///
-    /// Returns the removed vertex data if it could be found.
+    /// Returns the removed vertex data if it could be found, or `Ok(None)` if no vertex
+    /// exists at the given position.
     ///
     /// # Handle invalidation
     /// This method will invalidate all vertex, edge and face handles
     /// upon successful removal.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the target position has any `NAN` coordinate.
+    /// Returns [RemovalError::NAN] if the target position has any `NAN` coordinate.
     ///
     /// *See also [remove](Triangulation::remove)*
     fn locate_and_remove(
         &mut self,
         point: Point2<<Self::Vertex as HasPosition>::Scalar>,
-    ) -> Option<Self::Vertex> {
-        match self.locate_with_hint_option_core(point, None) {
-            PositionInTriangulation::OnVertex(handle) => Some(self.remove(handle)),
-            _ => None,
+    ) -> Result<Option<Self::Vertex>, RemovalError> {
+        match self.locate_with_hint_option_core(point, None)? {
+            PositionInTriangulation::OnVertex(handle) => self.remove(handle).map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -529,8 +534,16 @@ pub trait Triangulation: Default {
     ///
     /// # Handle invalidation
     /// This method will invalidate all vertex, edge and face handles.
-    fn remove(&mut self, vertex: FixedVertexHandle) -> Self::Vertex {
-        self.remove_and_notify(vertex)
+    ///
+    /// # Errors
+    ///
+    /// Returns [RemovalError::InvalidHandle] and leaves the triangulation unchanged if `vertex`
+    /// does not refer to a vertex of this triangulation.
+    fn remove(&mut self, vertex: FixedVertexHandle) -> Result<Self::Vertex, RemovalError> {
+        if vertex.index() >= self.num_vertices() {
+            return Err(RemovalError::InvalidHandle);
+        }
+        Ok(self.remove_and_notify(vertex)?)
     }
 
     /// Inserts a new vertex into the triangulation.
@@ -672,17 +685,20 @@ where
     ///
     /// Memory usage is, on average, in O(|convex_hull(E)|) where "E" refers to all edges that
     /// have been returned so far.
+    #[allow(clippy::type_complexity)]
     fn get_edges_in_rectangle(
         &self,
         lower: Point2<<Self::Vertex as HasPosition>::Scalar>,
         upper: Point2<<Self::Vertex as HasPosition>::Scalar>,
-    ) -> EdgesInShapeIterator<'_, Self, RectangleMetric<<Self::Vertex as HasPosition>::Scalar>>
-    {
+    ) -> Result<
+        EdgesInShapeIterator<'_, Self, RectangleMetric<<Self::Vertex as HasPosition>::Scalar>>,
+        QueryError,
+    > {
         let distance_metric = RectangleMetric::new(lower, upper);
         let center = lower.add(upper).mul(0.5f32.into());
-        EdgesInShapeIterator {
-            inner_iter: FloodFillIterator::new(self, distance_metric, center),
-        }
+        Ok(EdgesInShapeIterator {
+            inner_iter: FloodFillIterator::new(self, distance_metric, center)?,
+        })
     }
 
     /// Returns all edges contained in a circle.
@@ -696,23 +712,27 @@ where
     ///
     /// *Example: Shows all edges (red) that are returned when iterating over a circle (teal)*
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `radius_2 < 0.0`
+    /// Returns [QueryError::InvalidRadius] if `radius_2` is negative or NaN.
     ///
     /// # Memory consumption
     ///
     /// Memory usage is, on average, in O(|convex_hull(E)|) where "E" refers to all edges that
     /// have been returned so far.
+    #[allow(clippy::type_complexity)]
     fn get_edges_in_circle(
         &self,
         center: Point2<<Self::Vertex as HasPosition>::Scalar>,
         radius_2: <Self::Vertex as HasPosition>::Scalar,
-    ) -> EdgesInShapeIterator<'_, Self, CircleMetric<<Self::Vertex as HasPosition>::Scalar>> {
-        let metric = CircleMetric::new(center, radius_2);
-        EdgesInShapeIterator {
-            inner_iter: FloodFillIterator::new(self, metric, center),
-        }
+    ) -> Result<
+        EdgesInShapeIterator<'_, Self, CircleMetric<<Self::Vertex as HasPosition>::Scalar>>,
+        QueryError,
+    > {
+        let metric = CircleMetric::new(center, radius_2)?;
+        Ok(EdgesInShapeIterator {
+            inner_iter: FloodFillIterator::new(self, metric, center)?,
+        })
     }
 
     /// Returns all vertices in a rectangle.
@@ -730,16 +750,23 @@ where
     ///
     /// Consumed memory is in `O(|convex_hull(V)|)` where `V` refers to all vertices that have been
     /// returned so far.
+    #[allow(clippy::type_complexity)]
     fn get_vertices_in_rectangle(
         &self,
         lower: Point2<<Self::Vertex as HasPosition>::Scalar>,
         upper: Point2<<Self::Vertex as HasPosition>::Scalar>,
-    ) -> VerticesInShapeIterator<'_, Self, RectangleMetric<<Self::Vertex as HasPosition>::Scalar>>
-    {
+    ) -> Result<
+        VerticesInShapeIterator<'_, Self, RectangleMetric<<Self::Vertex as HasPosition>::Scalar>>,
+        QueryError,
+    > {
         let distance_metric = RectangleMetric::new(lower, upper);
         let center = lower.add(upper).mul(0.5f32.into());
 
-        VerticesInShapeIterator::new(FloodFillIterator::new(self, distance_metric, center))
+        Ok(VerticesInShapeIterator::new(FloodFillIterator::new(
+            self,
+            distance_metric,
+            center,
+        )?))
     }
 
     /// Returns all vertices in a circle.
@@ -752,23 +779,30 @@ where
     ///
     /// *Example: Shows all vertices (red) that are returned when iterating over a circle (teal)*
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `radius_2 < 0.0`
+    /// Returns [QueryError::InvalidRadius] if `radius_2` is negative or NaN.
     ///
     /// # Memory consumption
     ///
     /// Consumed memory is in `O(|convex_hull(V)|)` where `V` refers to all vertices that have been
     /// returned so far.
+    #[allow(clippy::type_complexity)]
     fn get_vertices_in_circle(
         &self,
         center: Point2<<Self::Vertex as HasPosition>::Scalar>,
         radius_2: <Self::Vertex as HasPosition>::Scalar,
-    ) -> VerticesInShapeIterator<'_, Self, CircleMetric<<Self::Vertex as HasPosition>::Scalar>>
-    {
-        let distance_metric = CircleMetric::new(center, radius_2);
+    ) -> Result<
+        VerticesInShapeIterator<'_, Self, CircleMetric<<Self::Vertex as HasPosition>::Scalar>>,
+        QueryError,
+    > {
+        let distance_metric = CircleMetric::new(center, radius_2)?;
 
-        VerticesInShapeIterator::new(FloodFillIterator::new(self, distance_metric, center))
+        Ok(VerticesInShapeIterator::new(FloodFillIterator::new(
+            self,
+            distance_metric,
+            center,
+        )?))
     }
 
     /// Used for barycentric interpolation on this triangulation. Refer to the documentation of

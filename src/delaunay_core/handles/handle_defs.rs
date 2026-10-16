@@ -3,6 +3,7 @@ use core::convert::TryInto;
 use super::super::Dcel;
 use super::public_handles::{InnerOuterMarker, PossiblyOuterTag};
 use super::FixedVertexHandle;
+use crate::HandleIndexError;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -51,23 +52,37 @@ impl FixedVertexHandle {
     /// invalid vertex handles. When possible, attempt to retrieve handles by other means
     /// instead (see [crate::handles]).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `index >= 2^32`
-    pub fn from_index(index: usize) -> Self {
+    /// Returns [HandleIndexError] if `index >= 2^32`.
+    pub fn from_index(index: usize) -> Result<Self, HandleIndexError> {
         // Preferably, `new` would simply be public. However, that would allow to create a handle
         // to the outer face marked with `InnerTag` which is bad. Let's only allow vertices for now.
-        Self::new(index)
+        let index = index.try_into().map_err(|_| HandleIndexError::new(index))?;
+        Ok(Self::new_internal(index))
+    }
+}
+
+impl TryFrom<usize> for FixedVertexHandle {
+    type Error = HandleIndexError;
+
+    fn try_from(index: usize) -> Result<Self, Self::Error> {
+        Self::from_index(index)
     }
 }
 
 impl<Type: Default, InnerOuter: InnerOuterMarker> FixedHandleImpl<Type, InnerOuter> {
+    /// Creates a handle for an element index of a triangulation.
+    ///
+    /// Triangulations never grow beyond `u32::MAX` elements (see
+    /// [InsertionError::TooManyVertices](crate::InsertionError::TooManyVertices)), so every index
+    /// passed here fits into a `u32`.
     pub(crate) fn new(index: usize) -> Self {
-        Self::new_internal(
-            index
-                .try_into()
-                .expect("Index too big - at most 2^32 elements supported"),
-        )
+        let index = index.try_into().unwrap_or_else(|_| {
+            debug_assert!(false, "Handle index exceeds u32::MAX. This is a bug.");
+            u32::MAX
+        });
+        Self::new_internal(index)
     }
 
     pub(crate) fn max() -> Self {

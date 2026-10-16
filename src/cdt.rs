@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cdt::ConflictRegionEnd::{EdgeOverlap, Existing};
 use crate::delaunay_core::dcel_operations::{
-    append_unconnected_vertex, flip_cw, new_with_fixed_vertices,
+    append_unconnected_vertex, check_vertex_capacity, flip_cw, new_with_fixed_vertices,
 };
 use crate::delaunay_core::{bulk_load_cdt, try_bulk_load_cdt};
 use crate::{
@@ -16,8 +16,9 @@ use crate::{
 };
 use crate::{handles::*, intersection_iterator::Intersection};
 use crate::{
-    mitigate_underflow, DelaunayTriangulation, HasPosition, HintGenerator, InsertionError,
-    LastUsedVertexHintGenerator, Point2, Triangulation, TriangulationExt,
+    mitigate_underflow, AddConstraintError, BulkLoadCdtError, DelaunayTriangulation, HasPosition,
+    HintGenerator, InternalError, LastUsedVertexHintGenerator, Point2, QueryError, RemovalError,
+    Triangulation, TriangulationExt,
 };
 
 /// Undirected edge type of a [ConstrainedDelaunayTriangulation] (CDT).
@@ -45,12 +46,18 @@ impl<UE> CdtEdge<UE> {
     }
 
     fn make_constraint_edge(&mut self) {
-        assert!(!self.is_constraint_edge());
+        debug_assert!(
+            !self.is_constraint_edge(),
+            "Edge is already a constraint edge. This is a bug."
+        );
         self.0 = true;
     }
 
     fn unmake_constraint_edge(&mut self) {
-        assert!(self.is_constraint_edge());
+        debug_assert!(
+            self.is_constraint_edge(),
+            "Edge is not a constraint edge. This is a bug."
+        );
         self.0 = false;
     }
 
@@ -117,11 +124,11 @@ impl<UE> AsMut<UE> for CdtEdge<UE> {
 ///
 /// ```
 /// use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
-/// # fn try_main() -> Result<(), spade::InsertionError> {
+/// # fn try_main() -> Result<(), spade::AddConstraintError> {
 /// let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
 /// let v0 = cdt.insert(Point2::new(0f64, 0.0))?;
 /// let v1 = cdt.insert(Point2::new(1.0, 0.0))?;
-/// cdt.add_constraint(v0, v1);
+/// cdt.add_constraint(v0, v1)?;
 /// // Alternatively, consider using this shorthand
 /// cdt.add_constraint_edge(Point2::new(1.0, 1.0), Point2::new(1.0, 0.0))?;
 /// println!("Number of constraints: {}", cdt.num_constraints()); // 2 constraints
@@ -131,7 +138,7 @@ impl<UE> AsMut<UE> for CdtEdge<UE> {
 /// // Check if a new constraint could be added
 /// let from = Point2::new(1.0, -2.0);
 /// let to = Point2::new(1.0, 0.0);
-/// if !cdt.intersects_constraint(from, to) {
+/// if !cdt.intersects_constraint(from, to)? {
 ///     // No intersections, the edge can be added
 ///     cdt.add_constraint_edge(from, to)?;
 /// }
@@ -249,7 +256,11 @@ where
     ///
     /// # Handle invalidation
     /// This method will invalidate all vertex, edge and face handles.
-    fn remove(&mut self, vertex: FixedVertexHandle) -> V {
+    fn remove(&mut self, vertex: FixedVertexHandle) -> Result<V, RemovalError> {
+        if vertex.index() >= self.num_vertices() {
+            return Err(RemovalError::InvalidHandle);
+        }
+
         let removed_constraints = self
             .dcel
             .vertex(vertex)
@@ -262,7 +273,7 @@ where
             self.remove_constraint_edge(e);
         }
 
-        self.remove_and_notify(vertex)
+        Ok(self.remove_and_notify(vertex)?)
     }
 
     fn into_parts(
@@ -326,7 +337,7 @@ where
     ///
     /// # Example
     /// ```
-    /// # fn main() -> Result<(), spade::InsertionError> {
+    /// # fn main() -> Result<(), spade::BulkLoadCdtError> {
     /// use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
     /// let mut vertices = vec![
     ///     Point2::new(0.0, 1.0),
@@ -349,14 +360,19 @@ where
     /// # }
     /// ```
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if any constraint edges overlap. Panics if the edges contain an invalid index (out of range).
-    pub fn bulk_load_cdt(vertices: Vec<V>, edges: Vec<[usize; 2]>) -> Result<Self, InsertionError> {
+    /// Returns [BulkLoadCdtError::ConflictingEdge] if any constraint edges intersect,
+    /// [BulkLoadCdtError::InvalidEdgeIndex] if the edges contain an invalid index (out of range) and
+    /// [BulkLoadCdtError::Insertion] if a vertex could not be inserted.
+    pub fn bulk_load_cdt(
+        vertices: Vec<V>,
+        edges: Vec<[usize; 2]>,
+    ) -> Result<Self, BulkLoadCdtError> {
         bulk_load_cdt(vertices, edges)
     }
 
-    /// Same behavior as [Self::bulk_load_cdt], but rather than panicking,
+    /// Same behavior as [Self::bulk_load_cdt], but rather than failing,
     /// skips and calls the parameter function `on_conflict_found` whenever a conflict occurs.
     ///
     /// For any conflicting pair of constraint edges it is unspecified which constraint is reported.
@@ -367,7 +383,7 @@ where
     ///
     /// # Example
     /// ```
-    /// # fn main() -> Result<(), spade::InsertionError> {
+    /// # fn main() -> Result<(), spade::BulkLoadCdtError> {
     /// use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
     /// let mut vertices = vec![
     ///     Point2::new(0.0, 1.0),
@@ -398,7 +414,7 @@ where
         vertices: Vec<V>,
         edges: Vec<[usize; 2]>,
         on_conflict_found: impl FnMut([usize; 2]),
-    ) -> Result<Self, InsertionError> {
+    ) -> Result<Self, BulkLoadCdtError> {
         try_bulk_load_cdt(vertices, edges, on_conflict_found)
     }
 
@@ -410,14 +426,14 @@ where
     pub fn bulk_load_cdt_stable(
         vertices: Vec<V>,
         edges: Vec<[usize; 2]>,
-    ) -> Result<Self, InsertionError> {
+    ) -> Result<Self, BulkLoadCdtError> {
         Self::bulk_load_cdt(vertices, edges)
     }
 
     /// # Handle invalidation
     /// See [Triangulation::remove]. This function was accidentally implemented separately for CDTs and will be removed in future releases.
     /// Use the method from the trait to avoid breakage.
-    pub fn remove(&mut self, vertex: FixedVertexHandle) -> V {
+    pub fn remove(&mut self, vertex: FixedVertexHandle) -> Result<V, RemovalError> {
         <Self as Triangulation>::remove(self, vertex)
     }
 
@@ -440,34 +456,50 @@ where
 
     /// Checks if a constraint edge can be added.
     ///
-    /// Returns `false` if the line from `from` to `to` intersects another
+    /// Returns `Ok(false)` if the line from `from` to `to` intersects another
     /// constraint edge.
-    pub fn can_add_constraint(&self, from: FixedVertexHandle, to: FixedVertexHandle) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Only returns [QueryError::Internal], see [InternalError].
+    pub fn can_add_constraint(
+        &self,
+        from: FixedVertexHandle,
+        to: FixedVertexHandle,
+    ) -> Result<bool, QueryError> {
         let line_intersection_iterator = LineIntersectionIterator::new_from_handles(self, from, to);
-        !self.contains_any_constraint_edge(line_intersection_iterator)
+        Ok(!self.contains_any_constraint_edge(line_intersection_iterator)?)
     }
 
     /// Checks if a line intersects a constraint edge.
     ///
-    /// Returns `true` if the edge from `from` to `to` intersects a
+    /// Returns `Ok(true)` if the edge from `from` to `to` intersects a
     /// constraint edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [QueryError::NAN] if `line_from` has any `NAN` coordinate.
     pub fn intersects_constraint(
         &self,
         line_from: Point2<V::Scalar>,
         line_to: Point2<V::Scalar>,
-    ) -> bool {
-        let line_intersection_iterator = LineIntersectionIterator::new(self, line_from, line_to);
-        self.contains_any_constraint_edge(line_intersection_iterator)
+    ) -> Result<bool, QueryError> {
+        let line_intersection_iterator = LineIntersectionIterator::new(self, line_from, line_to)?;
+        Ok(self.contains_any_constraint_edge(line_intersection_iterator)?)
     }
 
     fn contains_any_constraint_edge(
         &self,
         mut line_intersection_iterator: LineIntersectionIterator<V, DE, CdtEdge<UE>, F>,
-    ) -> bool {
-        line_intersection_iterator.any(|intersection| match intersection {
+    ) -> Result<bool, InternalError> {
+        let result = line_intersection_iterator.any(|intersection| match intersection {
             Intersection::EdgeIntersection(edge) => edge.is_constraint_edge(),
             _ => false,
-        })
+        });
+        match line_intersection_iterator.error() {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
     }
 
     /// Creates a several constraint edges by taking and connecting vertices from an iterator.
@@ -481,7 +513,7 @@ where
     ///
     /// # Example
     /// ```
-    /// # fn main() -> Result<(), spade::InsertionError> {
+    /// # fn main() -> Result<(), spade::AddConstraintError> {
     /// use spade::{ConstrainedDelaunayTriangulation, Point2};
     ///
     /// const NUM_VERTICES: usize = 51;
@@ -499,14 +531,17 @@ where
     /// # Ok(()) }
     /// ```
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if any of the generated constraints intersects with any other constraint edge.
+    /// Returns [AddConstraintError::IntersectsConstraintEdge] if any of the generated constraints
+    /// intersects with any other constraint edge, or [AddConstraintError::Insertion] if a vertex
+    /// could not be inserted. Vertices and constraint edges added before the error occurred
+    /// remain in the triangulation.
     pub fn add_constraint_edges(
         &mut self,
         vertices: impl IntoIterator<Item = V>,
         closed: bool,
-    ) -> Result<(), InsertionError> {
+    ) -> Result<(), AddConstraintError> {
         let mut iter = vertices.into_iter();
         if let Some(first) = iter.next() {
             let first_handle = self.insert(first)?;
@@ -514,12 +549,12 @@ where
             let mut current_handle = first_handle;
             for current in iter {
                 current_handle = self.insert(current)?;
-                self.add_constraint(previous_handle, current_handle);
+                self.add_constraint(previous_handle, current_handle)?;
                 previous_handle = current_handle;
             }
 
             if closed && current_handle != first_handle {
-                self.add_constraint(current_handle, first_handle);
+                self.add_constraint(current_handle, first_handle)?;
             }
         }
 
@@ -530,36 +565,40 @@ where
     ///
     /// Returns `true` if at least one constraint edge was added.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the new constraint edge intersects with an existing
-    /// constraint edge. Use [can_add_constraint](Self::can_add_constraint) to check.
-    pub fn add_constraint_edge(&mut self, from: V, to: V) -> Result<bool, InsertionError> {
+    /// Returns [AddConstraintError::IntersectsConstraintEdge] if the new constraint edge
+    /// intersects an existing constraint edge (the two vertices remain inserted), or
+    /// [AddConstraintError::Insertion] if a vertex could not be inserted.
+    pub fn add_constraint_edge(&mut self, from: V, to: V) -> Result<bool, AddConstraintError> {
         let from_handle = self.insert(from)?;
         let to_handle = self.insert(to)?;
-        Ok(self.add_constraint(from_handle, to_handle))
+        let initial_num_constraints = self.num_constraints();
+        self.add_constraint(from_handle, to_handle)?;
+        Ok(self.num_constraints() != initial_num_constraints)
     }
 
     /// Adds a constraint edge between to vertices.
     ///
-    /// Returns `true` if at least one constraint edge was added.
     /// Note that the given constraint might be split into smaller edges
     /// if a vertex in the triangulation lies exactly on the constraint edge.
     /// Thus, `cdt.exists_constraint(from, to)` is not necessarily `true`
     /// after a call to this function.
     ///
-    /// Returns false and does nothing if `from == to`.
+    /// Does nothing if `from == to`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the new constraint edge intersects an existing
-    /// constraint edge. Use [Self::try_add_constraint] or [Self::add_constraint_and_split] to work
-    /// around that.
-    pub fn add_constraint(&mut self, from: FixedVertexHandle, to: FixedVertexHandle) -> bool {
-        let initial_num_constraints = self.num_constraints();
-        self.resolve_splitting_constraint_request(from, to, None);
-
-        self.num_constraints != initial_num_constraints
+    /// Returns [AddConstraintError::IntersectsConstraintEdge] and leaves the triangulation
+    /// unchanged if the new constraint edge intersects an existing constraint edge.
+    /// Use [Self::add_constraint_and_split] to split intersected constraint edges instead.
+    pub fn add_constraint(
+        &mut self,
+        from: FixedVertexHandle,
+        to: FixedVertexHandle,
+    ) -> Result<(), AddConstraintError> {
+        self.try_add_constraint(from, to)?;
+        Ok(())
     }
 
     /// Takes a conflict region (expressed as a list of intersecting edges) rotates edges to create
@@ -611,8 +650,10 @@ where
         &mut self,
         conflict_edges: Vec<FixedDirectedEdgeHandle>,
         target_vertex: FixedVertexHandle,
-    ) -> Option<FixedDirectedEdgeHandle> {
-        let first = conflict_edges.first()?;
+    ) -> Result<Option<FixedDirectedEdgeHandle>, InternalError> {
+        let Some(first) = conflict_edges.first() else {
+            return Ok(None);
+        };
 
         let mut temporary_constraint_edges = Vec::new();
 
@@ -667,7 +708,7 @@ where
             make_temporary_edge(self, next);
         }
 
-        self.legalize_edges_after_removal(
+        let legalization_result = self.legalize_edges_after_removal(
             &mut conflict_edges
                 .into_iter()
                 .map(|edge| edge.as_undirected())
@@ -680,10 +721,15 @@ where
             self.undirected_edge_data_mut(edge).0 = false;
         }
 
-        result
+        legalization_result?;
+        Ok(result)
     }
 
     /// Returns all constraint edges that would prevent creating a new constraint between two points.
+    ///
+    /// # Errors
+    ///
+    /// Returns [QueryError::NAN] if `from` has any `NAN` coordinate.
     ///
     /// # See also
     ///
@@ -692,10 +738,11 @@ where
         &self,
         from: Point2<<V as HasPosition>::Scalar>,
         to: Point2<<V as HasPosition>::Scalar>,
-    ) -> impl Iterator<Item = DirectedEdgeHandle<'_, V, DE, CdtEdge<UE>, F>> {
-        LineIntersectionIterator::new(self, from, to)
+    ) -> Result<impl Iterator<Item = DirectedEdgeHandle<'_, V, DE, CdtEdge<UE>, F>>, QueryError>
+    {
+        Ok(LineIntersectionIterator::new(self, from, to)?
             .flat_map(|intersection| intersection.as_edge_intersection())
-            .filter(|e| e.is_constraint_edge())
+            .filter(|e| e.is_constraint_edge()))
     }
 
     /// Returns all constraint edges that would prevent inserting a new constraint connecting two existing
@@ -773,20 +820,24 @@ where
     /// Returns all constraint edges that connect `from` and `to`. This includes any constraint
     /// edge that was already present.
     /// Multiple edges are returned if the line from `from` to `to` intersects an existing vertex.
-    /// Returns an empty list if the new constraint would intersect any existing constraint or if
-    /// `from == to`.
+    /// Returns an empty list if `from == to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [AddConstraintError::IntersectsConstraintEdge] and leaves the triangulation
+    /// unchanged if the new constraint would intersect any existing constraint.
     ///
     /// # Example
     ///
     /// ```
-    /// use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
-    /// # fn try_main() -> Result<(), spade::InsertionError> {
+    /// use spade::{AddConstraintError, ConstrainedDelaunayTriangulation, Point2, Triangulation};
+    /// # fn try_main() -> Result<(), AddConstraintError> {
     /// let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
     /// let v0 = cdt.insert(Point2::new(-1.0, 0.0))?;
     /// let v1 = cdt.insert(Point2::new(1.0, 0.0))?;
     /// let v2 = cdt.insert(Point2::new(0.0, 1.0))?;
     /// let v3 = cdt.insert(Point2::new(0.0, -1.0))?;
-    /// let first_constraints = cdt.try_add_constraint(v2, v3);
+    /// let first_constraints = cdt.try_add_constraint(v2, v3)?;
     /// let second_constraints = cdt.try_add_constraint(v0, v1);
     ///
     /// // The first constraint edge can be added as there are no intersecting constraint edges
@@ -796,10 +847,7 @@ where
     /// assert_eq!(edge.to().fix(), v3);
     ///
     /// // The second edge should not be created as it intersects the first edge.
-    /// assert!(second_constraints.is_empty());
-    ///
-    /// // Consider comparing this to the number of constraints prior to calling
-    /// // `try_add_constraint` to check if any new constraint edge was created.
+    /// assert_eq!(second_constraints, Err(AddConstraintError::IntersectsConstraintEdge));
     /// assert_eq!(cdt.num_constraints(), 1);
     /// # Ok(()) }
     /// # fn main() { try_main().unwrap() }
@@ -808,24 +856,26 @@ where
         &mut self,
         from: FixedVertexHandle,
         to: FixedVertexHandle,
-    ) -> Vec<FixedDirectedEdgeHandle> {
+    ) -> Result<Vec<FixedDirectedEdgeHandle>, AddConstraintError> {
         // Identify all potential constraint edge intersections (conflicts). This must be done
         // beforehand in case that the caller chooses to cancel the operation if any conflict is
         // detected. No mutation should happen in this case.
-        // The list of conflicts regions will be empty if a conflict occurred
-        let initial_conflict_regions = self.get_conflict_resolutions(from, to);
-        self.resolve_conflict_groups(initial_conflict_regions)
+        let initial_conflict_regions = self.get_conflict_resolutions(from, to)?;
+        Ok(self.resolve_conflict_groups(initial_conflict_regions)?)
     }
 
+    /// Collects the conflict regions along the line from `from` to `to` without mutating the
+    /// triangulation.
     fn get_conflict_resolutions(
-        &mut self,
+        &self,
         from: FixedVertexHandle,
         to: FixedVertexHandle,
-    ) -> Vec<InitialConflictRegion> {
+    ) -> Result<Vec<InitialConflictRegion>, AddConstraintError> {
         let mut conflict_groups = Vec::new();
         let mut current_group = Vec::new();
         let mut ignore_next_vertex = false;
-        for intersection in LineIntersectionIterator::new_from_handles(self, from, to) {
+        let mut iterator = LineIntersectionIterator::new_from_handles(self, from, to);
+        for intersection in iterator.by_ref() {
             match intersection {
                 Intersection::EdgeIntersection(edge) => {
                     if !edge.is_constraint_edge() {
@@ -833,7 +883,7 @@ where
                         continue;
                     }
 
-                    return Vec::new();
+                    return Err(AddConstraintError::IntersectsConstraintEdge);
                 }
                 Intersection::VertexIntersection(v) => {
                     if ignore_next_vertex {
@@ -860,15 +910,19 @@ where
             }
         }
 
-        conflict_groups
+        if let Some(error) = iterator.error() {
+            return Err(error.into());
+        }
+
+        Ok(conflict_groups)
     }
 
     fn resolve_splitting_constraint_request(
         &mut self,
         mut from: FixedVertexHandle,
         to: FixedVertexHandle,
-        vertex_constructor: Option<&dyn Fn(Point2<f64>) -> V>,
-    ) -> Vec<FixedDirectedEdgeHandle> {
+        vertex_constructor: &dyn Fn(Point2<f64>) -> V,
+    ) -> Result<Vec<FixedDirectedEdgeHandle>, AddConstraintError> {
         let mut result = Vec::new();
         let mut conflict_edges = Vec::new();
         let mut legalize_buffer = Vec::new();
@@ -876,7 +930,7 @@ where
         iterator.next();
 
         // This methods adds a constraint edge between two vertices. Any existing constraint edge that would intersect
-        // is being split (or results in a panic). This can lead to a few special cases, see below for more information.
+        // is being split. This can lead to a few special cases, see below for more information.
         //
         // Other than that, this method implements a "fast path" for adding a constraint edge if no existing edge is
         // being intersected. The fast path does not need to identify the whole conflict region again as those
@@ -903,10 +957,7 @@ where
                     // possible.
                     let line_intersection = get_edge_intersections(p0, p1, from_pos, to_pos);
                     let line_intersection = mitigate_underflow(line_intersection);
-                    let new_vertex = vertex_constructor
-                        .expect("The new constraint edge intersects an existing constraint edge.")(
-                        line_intersection,
-                    );
+                    let new_vertex = vertex_constructor(line_intersection);
 
                     // The position might have changed slightly for f32 vertices.
                     // Ensure to use this rounded position for all further calculations.
@@ -918,7 +969,7 @@ where
                     // as splitting the constraint won't create any invalid geometry (after legalizing).
                     // Otherwise, we'll use a close alternative vertex that is known to introduce no
                     // inconsistencies.
-                    let alternative_vertex = self.validate_split_position(edge, position);
+                    let alternative_vertex = self.validate_split_position(edge, position)?;
 
                     let final_vertex =
                         if let Some((alternative_vertex, is_end_vertex)) = alternative_vertex {
@@ -955,12 +1006,13 @@ where
                                 self.make_constraint_edge(next.as_undirected());
 
                                 legalize_buffer.push(edge.as_undirected());
-                                self.legalize_edges_after_removal(&mut legalize_buffer, |_| false);
+                                self.legalize_edges_after_removal(&mut legalize_buffer, |_| false)?;
                             }
 
                             alternative_vertex
                         } else {
                             let edge = edge.fix();
+                            check_vertex_capacity(self.s(), 1)?;
                             let new_vertex = append_unconnected_vertex(self.s_mut(), new_vertex);
                             let [e0, e1] = self.insert_on_edge(edge, new_vertex);
                             self.handle_legal_edge_split([e0, e1]);
@@ -972,10 +1024,18 @@ where
                     // efficiency gains. However, due to the necessary legalization, any number of conflict
                     // edges may have been flipped and needs to be recalculated. The simplest way is to call
                     // try_add_constraint.
-                    let previous_region = self.try_add_constraint(from, final_vertex);
-                    // Ensure that this call really added a constraint edge. There shouldn't be any constraint
-                    // edge in the way.
-                    assert!(!previous_region.is_empty() || from == final_vertex);
+                    let previous_region = match self.try_add_constraint(from, final_vertex) {
+                        // Ensure that this call really added a constraint edge. There shouldn't be
+                        // any constraint edge in the way.
+                        Ok(region) if !region.is_empty() || from == final_vertex => region,
+                        Err(AddConstraintError::Internal(error)) => return Err(error.into()),
+                        _ => {
+                            return Err(internal_error!(
+                                "Failed to connect to a split vertex. This is a bug."
+                            )
+                            .into())
+                        }
+                    };
                     result.extend(previous_region);
                     conflict_edges.clear();
 
@@ -993,7 +1053,7 @@ where
                     // Re-use the collected list of conflict edges.
                     let vertex = vertex.fix();
                     let copy = core::mem::take(&mut conflict_edges);
-                    let new_edge = self.resolve_conflict_region(copy, vertex);
+                    let new_edge = self.resolve_conflict_region(copy, vertex)?;
                     result.extend(new_edge);
                     iterator = LineIntersectionIterator::new_from_handles(self, vertex, to);
                     iterator.next();
@@ -1002,18 +1062,22 @@ where
             }
         }
 
+        if let Some(error) = iterator.error() {
+            return Err(error.into());
+        }
+
         for edge in &result {
             self.make_constraint_edge(edge.as_undirected());
         }
 
-        result
+        Ok(result)
     }
 
     fn validate_split_position(
         &self,
         conflict_edge: DirectedEdgeHandle<V, DE, CdtEdge<UE>, F>,
         split_position: Point2<<V as HasPosition>::Scalar>,
-    ) -> Option<(FixedVertexHandle, bool)> {
+    ) -> Result<Option<(FixedVertexHandle, bool)>, AddConstraintError> {
         // Not every split vertex may lead to a conflict region that will properly contain the
         // split vertex. This can happen as not all split positions can be represented precisely.
         //
@@ -1029,7 +1093,7 @@ where
         // Returns Some((..., `true`)) if the alternative vertex is either `conflict_edge.from` or
         // `conflict_edge.to`. This is important as, in case an opposite vertex is chosen, the set of
         // constraint edges needs to be adjusted slightly.
-        let is_valid = match self.locate_with_hint(split_position, conflict_edge.from().fix()) {
+        let is_valid = match self.locate_with_hint(split_position, conflict_edge.from().fix())? {
             PositionInTriangulation::OnEdge(real_edge) => {
                 real_edge.as_undirected() == conflict_edge.fix().as_undirected()
             }
@@ -1041,11 +1105,16 @@ where
                 conflict_edge.is_part_of_convex_hull()
             }
             PositionInTriangulation::OnVertex(_) => false,
-            PositionInTriangulation::NoTriangulation => unreachable!(),
+            PositionInTriangulation::NoTriangulation => {
+                return Err(internal_error!(
+                    "Triangulation with a constraint edge must not be empty. This is a bug."
+                )
+                .into())
+            }
         };
 
         if is_valid {
-            None
+            Ok(None)
         } else {
             let split_position = split_position.to_f64();
             let [d_from, d_to] = [conflict_edge.from(), conflict_edge.to()]
@@ -1079,14 +1148,14 @@ where
                 }
             }
 
-            Some((min_vertex.fix(), is_end_vertex))
+            Ok(Some((min_vertex.fix(), is_end_vertex)))
         }
     }
 
     fn resolve_conflict_groups(
         &mut self,
         conflict_groups: Vec<InitialConflictRegion>,
-    ) -> Vec<FixedDirectedEdgeHandle> {
+    ) -> Result<Vec<FixedDirectedEdgeHandle>, InternalError> {
         let mut constraint_edges = Vec::new();
 
         for InitialConflictRegion {
@@ -1105,14 +1174,14 @@ where
                 }
             };
 
-            constraint_edges.extend(self.resolve_conflict_region(conflict_edges, target_vertex));
+            constraint_edges.extend(self.resolve_conflict_region(conflict_edges, target_vertex)?);
         }
 
         for edge in &constraint_edges {
             self.make_constraint_edge(edge.as_undirected());
         }
 
-        constraint_edges
+        Ok(constraint_edges)
     }
 
     pub(crate) fn create_with_fixed_vertices(
@@ -1164,6 +1233,11 @@ where
     /// or any existing constraint edge.
     /// Returns an empty list if `from == to`.
     ///
+    /// # Errors
+    ///
+    /// Returns [AddConstraintError::Insertion] if a split vertex could not be inserted. Constraint
+    /// edges and split vertices created before the error occurred remain in the triangulation.
+    ///
     /// # Image example
     ///
     /// This is an input CDT with 3 constraints:
@@ -1178,22 +1252,22 @@ where
     ///
     ///```
     /// use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
-    /// # fn try_main() -> Result<(), spade::InsertionError> {
+    /// # fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     /// use spade::handles::FixedVertexHandle;
     /// let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
     /// let v0 = cdt.insert(Point2::new(-1.0, 0.0))?;
     /// let v1 = cdt.insert(Point2::new(1.0, 0.0))?;
     /// let v2 = cdt.insert(Point2::new(0.0, 1.0))?;
     /// let v3 = cdt.insert(Point2::new(0.0, -1.0))?;
-    /// cdt.add_constraint(v2, v3);
+    /// cdt.add_constraint(v2, v3)?;
     ///
     /// // Should create a new split vertex at the origin
-    /// let second_constraints = cdt.add_constraint_and_split(v0, v1, |v| v);
+    /// let second_constraints = cdt.add_constraint_and_split(v0, v1, |v| v)?;
     ///
     /// // Expect one additional point introduced by splitting the first constraint edge:
     /// assert_eq!(cdt.num_vertices(), 5);
     ///
-    /// let v4 = FixedVertexHandle::from_index(4); // Newly created
+    /// let v4 = FixedVertexHandle::from_index(4)?; // Newly created
     ///
     /// // Expect 4 constraints as the first constraint was split:
     /// assert_eq!(cdt.num_constraints(), 4);
@@ -1229,7 +1303,7 @@ where
         from: FixedVertexHandle,
         to: FixedVertexHandle,
         vertex_constructor: C,
-    ) -> Vec<FixedDirectedEdgeHandle>
+    ) -> Result<Vec<FixedDirectedEdgeHandle>, AddConstraintError>
     where
         C: Fn(Point2<<V as HasPosition>::Scalar>) -> V,
     {
@@ -1241,7 +1315,7 @@ where
             vertex_constructor(Point2::new(x, y))
         };
 
-        self.resolve_splitting_constraint_request(from, to, Some(r))
+        self.resolve_splitting_constraint_request(from, to, r)
     }
 }
 
@@ -1331,16 +1405,24 @@ mod test {
 
     use rand::distr::{Distribution, Uniform};
     use rand::seq::IndexedRandom as _;
-    use rand::{Rng, RngExt as _, SeedableRng};
+    use rand::{Rng, SeedableRng};
 
     use crate::delaunay_core::{FixedDirectedEdgeHandle, TriangulationExt};
     use crate::handles::FixedVertexHandle;
     use crate::test_utilities::*;
     use crate::{DelaunayTriangulation, InsertionError, Point2, Triangulation};
 
-    use super::ConstrainedDelaunayTriangulation;
+    use super::{AddConstraintError, ConstrainedDelaunayTriangulation};
+    use crate::BulkLoadCdtError;
 
     type Cdt = ConstrainedDelaunayTriangulation<Point2<f64>>;
+
+    /// Adds a constraint and returns `true` if at least one new constraint edge was created.
+    fn add_new_constraint(cdt: &mut Cdt, from: FixedVertexHandle, to: FixedVertexHandle) -> bool {
+        let initial_num_constraints = cdt.num_constraints();
+        cdt.add_constraint(from, to).unwrap();
+        cdt.num_constraints() != initial_num_constraints
+    }
     type Delaunay = DelaunayTriangulation<Point2<f64>>;
 
     #[test]
@@ -1358,14 +1440,14 @@ mod test {
     }
 
     #[test]
-    fn test_add_same_from_and_to_constraint() -> Result<(), InsertionError> {
+    fn test_add_same_from_and_to_constraint() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         let v0 = cdt.insert(Point2::new(0.0, 0.0))?;
         cdt.insert(Point2::new(2.0, 2.0))?;
         cdt.insert(Point2::new(1.0, 2.0))?;
 
-        assert!(!cdt.add_constraint(v0, v0));
-        assert!(cdt.try_add_constraint(v0, v0).is_empty());
+        assert!(!add_new_constraint(&mut cdt, v0, v0));
+        assert!(cdt.try_add_constraint(v0, v0).unwrap().is_empty());
 
         let new_point = Point2::new(3.1, 2.0);
         assert!(!cdt.add_constraint_edge(new_point, new_point)?);
@@ -1388,8 +1470,8 @@ mod test {
         assert!(cdt.get_edge_from_neighbors(v0, v1).is_none());
         assert!(cdt.get_edge_from_neighbors(v2, v3).is_some());
 
-        assert!(cdt.add_constraint(v1, v0));
-        assert!(!cdt.add_constraint(v0, v1));
+        assert!(add_new_constraint(&mut cdt, v1, v0));
+        assert!(!add_new_constraint(&mut cdt, v0, v1));
         let edge = cdt
             .get_edge_from_neighbors(v0, v1)
             .expect("Expected constraint edge")
@@ -1407,14 +1489,14 @@ mod test {
         let v0 = cdt.insert(Point2::new(0.0, 0.0))?;
         let v1 = cdt.insert(Point2::new(2.0, 2.0))?;
         let v2 = cdt.insert(Point2::new(1.0, 0.0))?;
-        assert!(cdt.add_constraint(v0, v1));
-        assert!(cdt.add_constraint(v0, v2));
-        assert!(cdt.add_constraint(v1, v2));
+        assert!(add_new_constraint(&mut cdt, v0, v1));
+        assert!(add_new_constraint(&mut cdt, v0, v2));
+        assert!(add_new_constraint(&mut cdt, v1, v2));
         for edge in cdt.undirected_edges() {
             assert!(cdt.is_constraint_edge(edge.fix()));
         }
-        assert!(!cdt.add_constraint(v1, v0));
-        assert!(!cdt.add_constraint(v1, v2));
+        assert!(!add_new_constraint(&mut cdt, v1, v0));
+        assert!(!add_new_constraint(&mut cdt, v1, v2));
         assert_eq!(cdt.num_constraints, 3);
         Ok(())
     }
@@ -1432,12 +1514,12 @@ mod test {
         cdt.insert(Point2::new(3.0, 0.0))?;
         assert!(cdt.get_edge_from_neighbors(v1, v2).is_some());
         let mut copy = cdt.clone();
-        assert!(cdt.add_constraint(v0, v3));
+        assert!(add_new_constraint(&mut cdt, v0, v3));
         assert_eq!(cdt.num_constraints(), 3);
 
-        copy.add_constraint(v2, v3);
+        copy.add_constraint(v2, v3).unwrap();
         assert_eq!(copy.num_constraints(), 1);
-        copy.add_constraint(v0, v3);
+        copy.add_constraint(v0, v3).unwrap();
         assert_eq!(copy.num_constraints(), 3);
         Ok(())
     }
@@ -1452,7 +1534,7 @@ mod test {
 
         let v1 = cdt.insert(Point2::new(2.0, 2.0))?;
         assert!(cdt.get_edge_from_neighbors(v0, v1).is_none());
-        cdt.add_constraint(v0, v1);
+        cdt.add_constraint(v0, v1).unwrap();
         cdt.cdt_sanity_check();
         let edge = cdt
             .get_edge_from_neighbors(v0, v1)
@@ -1473,7 +1555,7 @@ mod test {
         for point in points.into_iter() {
             handles.push(cdt.insert(point)?);
         }
-        cdt.add_constraint(handles[40], handles[200]);
+        cdt.add_constraint(handles[40], handles[200]).unwrap();
         assert_eq!(cdt.num_constraints(), 1);
         cdt.cdt_sanity_check();
         Ok(())
@@ -1490,7 +1572,7 @@ mod test {
         }
         let v0 = cdt.insert(Point2::new(-20., max_y + 10.))?;
         let v1 = cdt.insert(Point2::new(20., max_y + 10.))?;
-        cdt.add_constraint(v0, v1);
+        cdt.add_constraint(v0, v1).unwrap();
         assert_eq!(cdt.num_constraints(), 1);
         cdt.cdt_sanity_check();
         Ok(())
@@ -1536,7 +1618,7 @@ mod test {
                 let h0 = cdt.insert(v.position())?;
                 let h1 = cdt.insert(to.position())?;
 
-                if cdt.add_constraint(h0, h1) {
+                if add_new_constraint(&mut cdt, h0, h1) {
                     inserted_constraints.push((h0, h1));
                 }
                 cdt.cdt_sanity_check();
@@ -1563,7 +1645,7 @@ mod test {
         let v0 = cdt.insert(Point2::new(-8.907731924022768, 1.7433952434737847))?;
         let v1 = cdt.insert(Point2::new(-7.899415172394501, -1.4867902598716558))?;
         cdt.cdt_sanity_check();
-        cdt.add_constraint(v0, v1);
+        cdt.add_constraint(v0, v1).unwrap();
         cdt.cdt_sanity_check();
         Ok(())
     }
@@ -1576,7 +1658,7 @@ mod test {
         cdt.insert(Point2::new(0.0, 1.0))?;
         let v0 = cdt.insert(Point2::new(0.0, 0.5))?;
         let v_last = cdt.insert(Point2::new(1.0, 0.5))?;
-        cdt.add_constraint(v0, v_last);
+        cdt.add_constraint(v0, v_last).unwrap();
         assert_eq!(cdt.num_constraints(), 1);
         // These points split an existing constraint
         let v1 = cdt.insert(Point2::new(0.25, 0.5))?;
@@ -1604,7 +1686,7 @@ mod test {
         cdt.insert(Point2::new(4.0, -0.25))?;
         let v7 = cdt.insert(Point2::new(5.0, 0.0))?;
         assert!(cdt.get_edge_from_neighbors(v3, v4).is_some());
-        cdt.add_constraint(v0, v7);
+        cdt.add_constraint(v0, v7).unwrap();
         assert!(cdt.get_edge_from_neighbors(v0, v7).is_some());
         assert!(cdt.get_edge_from_neighbors(v3, v4).is_none());
 
@@ -1619,7 +1701,7 @@ mod test {
         let v1 = cdt.insert(Point2::new(1.0, 0.0))?;
         let v2 = cdt.insert(Point2::new(2.0, 0.0))?;
         cdt.insert(Point2::new(0.0, 1.0))?;
-        cdt.add_constraint(v0, v2);
+        cdt.add_constraint(v0, v2).unwrap();
         assert_eq!(cdt.num_constraints(), 2);
         assert!(cdt.exists_constraint(v0, v1));
         assert!(cdt.exists_constraint(v1, v2));
@@ -1633,38 +1715,38 @@ mod test {
         let v1 = cdt.insert(Point2::new(0.0, 1.0))?;
         cdt.insert(Point2::new(0.0, 0.0))?;
         cdt.insert(Point2::new(1.0, 1.0))?;
-        cdt.add_constraint(v0, v1);
+        cdt.add_constraint(v0, v1).unwrap();
         Ok(cdt)
     }
 
     #[test]
-    fn test_check_intersects_constraint_edge() -> Result<(), InsertionError> {
+    fn test_check_intersects_constraint_edge() -> Result<(), AddConstraintError> {
         let cdt = test_cdt()?;
         let from = Point2::new(0.2, 0.2);
         let to = Point2::new(0.6, 0.7);
-        assert!(cdt.intersects_constraint(from, to));
-        assert!(cdt.intersects_constraint(to, from));
+        assert!(cdt.intersects_constraint(from, to).unwrap());
+        assert!(cdt.intersects_constraint(to, from).unwrap());
         let to = Point2::new(-0.5, 0.2);
-        assert!(!cdt.intersects_constraint(from, to));
+        assert!(!cdt.intersects_constraint(from, to).unwrap());
         let from = Point2::new(0.5, 0.5);
-        assert!(cdt.intersects_constraint(from, to));
-        assert!(cdt.intersects_constraint(to, from));
+        assert!(cdt.intersects_constraint(from, to).unwrap());
+        assert!(cdt.intersects_constraint(to, from).unwrap());
         Ok(())
     }
 
     #[test]
-    fn test_add_constraint_degenerate() -> Result<(), InsertionError> {
+    fn test_add_constraint_degenerate() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         let v0 = cdt.insert(Point2::new(0.0, 0.0))?;
         let v1 = cdt.insert(Point2::new(0.0, 1.0))?;
-        assert!(cdt.add_constraint(v0, v1));
-        assert!(!cdt.add_constraint(v1, v0));
+        assert!(add_new_constraint(&mut cdt, v0, v1));
+        assert!(!add_new_constraint(&mut cdt, v1, v0));
         assert_eq!(cdt.num_constraints(), 1);
         let mut cdt = Cdt::new();
         let v0 = cdt.insert(Point2::new(0.0, 0.0))?;
         let v1 = cdt.insert(Point2::new(0.0, 2.0))?;
         cdt.insert(Point2::new(0.0, 1.0))?;
-        assert!(cdt.add_constraint(v0, v1));
+        assert!(add_new_constraint(&mut cdt, v0, v1));
         assert_eq!(cdt.num_constraints(), 2);
         Ok(())
     }
@@ -1688,7 +1770,7 @@ mod test {
     }
 
     #[test]
-    fn fuzz_test_on_line() -> Result<(), InsertionError> {
+    fn fuzz_test_on_line() -> Result<(), AddConstraintError> {
         // Generates points on a single line and randomly connects
         // them with constraints.
         let seed = SEED;
@@ -1704,7 +1786,7 @@ mod test {
             let to = cdt.insert(to)?;
             let should_add_constraint: bool = rng.random();
             if from != to && should_add_constraint {
-                cdt.add_constraint(from, to);
+                cdt.add_constraint(from, to).unwrap();
             }
 
             cdt.cdt_sanity_check();
@@ -1753,51 +1835,64 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    fn test_panic_when_intersecting_a_constraint_edge() {
-        let mut cdt = Cdt::new();
-        let v0 = cdt.insert(Point2::new(0.0, 0.0)).unwrap();
-        let v1 = cdt.insert(Point2::new(1.0, 0.0)).unwrap();
-        cdt.add_constraint(v0, v1);
-        cdt.add_constraint(v0, v1);
-        cdt.add_constraint_edge(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))
-            .unwrap();
-        cdt.add_constraint_edge(Point2::new(0.5, 0.5), Point2::new(0.5, -0.5))
-            .unwrap();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_panic_when_intersecting_a_complex_constraint_edge() {
-        let mut cdt = Cdt::new();
-        let v0 = cdt.insert(Point2::new(0.5, 2.0)).unwrap();
-        cdt.insert(Point2::new(0.0, 1.5)).unwrap();
-        cdt.insert(Point2::new(1.0, 1.5)).unwrap();
-        cdt.add_constraint_edge(Point2::new(0.0, 0.5), Point2::new(1.0, 0.5))
-            .unwrap();
-        let v1 = cdt.insert(Point2::new(0.5, 0.0)).unwrap();
-
-        cdt.add_constraint(v0, v1);
-    }
-
-    #[test]
-    fn test_cdt_remove_degenerate() -> Result<(), InsertionError> {
+    fn test_error_when_intersecting_a_constraint_edge() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         let v0 = cdt.insert(Point2::new(0.0, 0.0))?;
         let v1 = cdt.insert(Point2::new(1.0, 0.0))?;
-        let v2 = cdt.insert(Point2::new(0.0, 1.0))?;
-        cdt.add_constraint(v0, v1);
-        cdt.add_constraint(v1, v2);
-        cdt.add_constraint(v2, v0);
-        assert_eq!(cdt.num_constraints(), 3);
-        cdt.remove(v1);
+        cdt.add_constraint(v0, v1)?;
+        cdt.add_constraint(v0, v1)?;
+        cdt.add_constraint_edge(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))?;
+        assert_eq!(
+            cdt.add_constraint_edge(Point2::new(0.5, 0.5), Point2::new(0.5, -0.5)),
+            Err(AddConstraintError::IntersectsConstraintEdge)
+        );
         assert_eq!(cdt.num_constraints(), 1);
         cdt.cdt_sanity_check();
         Ok(())
     }
 
     #[test]
-    fn test_crash_scenario() -> Result<(), InsertionError> {
+    fn test_error_when_intersecting_a_complex_constraint_edge() -> Result<(), AddConstraintError> {
+        let mut cdt = Cdt::new();
+        let v0 = cdt.insert(Point2::new(0.5, 2.0))?;
+        cdt.insert(Point2::new(0.0, 1.5))?;
+        cdt.insert(Point2::new(1.0, 1.5))?;
+        cdt.add_constraint_edge(Point2::new(0.0, 0.5), Point2::new(1.0, 0.5))?;
+        let v1 = cdt.insert(Point2::new(0.5, 0.0))?;
+
+        let before = cdt.clone();
+        assert_eq!(
+            cdt.add_constraint(v0, v1),
+            Err(AddConstraintError::IntersectsConstraintEdge)
+        );
+        // A failed request must not mutate the triangulation.
+        assert_eq!(cdt.num_constraints(), before.num_constraints());
+        assert!(cdt
+            .directed_edges()
+            .map(|e| e.positions())
+            .eq(before.directed_edges().map(|e| e.positions())));
+        cdt.cdt_sanity_check();
+        Ok(())
+    }
+
+    #[test]
+    fn test_cdt_remove_degenerate() -> Result<(), AddConstraintError> {
+        let mut cdt = Cdt::new();
+        let v0 = cdt.insert(Point2::new(0.0, 0.0))?;
+        let v1 = cdt.insert(Point2::new(1.0, 0.0))?;
+        let v2 = cdt.insert(Point2::new(0.0, 1.0))?;
+        cdt.add_constraint(v0, v1).unwrap();
+        cdt.add_constraint(v1, v2).unwrap();
+        cdt.add_constraint(v2, v0).unwrap();
+        assert_eq!(cdt.num_constraints(), 3);
+        cdt.remove(v1).unwrap();
+        assert_eq!(cdt.num_constraints(), 1);
+        cdt.cdt_sanity_check();
+        Ok(())
+    }
+
+    #[test]
+    fn test_crash_scenario() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         for point in get_points().iter().cloned() {
             cdt.insert(point)?;
@@ -1808,7 +1903,7 @@ mod test {
         let to = cdt.insert(Point2::new(-8.839844309691154, -8.930685085211245))?;
         cdt.cdt_sanity_check();
 
-        cdt.add_constraint(from, to);
+        cdt.add_constraint(from, to).unwrap();
         cdt.cdt_sanity_check();
 
         Ok(())
@@ -1825,7 +1920,7 @@ mod test {
     }
 
     #[test]
-    fn test_add_constraint_edges() -> Result<(), InsertionError> {
+    fn test_add_constraint_edges() -> Result<(), AddConstraintError> {
         for is_closed in [true, false] {
             let mut cdt = Cdt::new();
 
@@ -1851,7 +1946,7 @@ mod test {
     }
 
     #[test]
-    fn test_add_constraint_edges_empty() -> Result<(), InsertionError> {
+    fn test_add_constraint_edges_empty() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
 
         cdt.add_constraint_edges(core::iter::empty(), false)?;
@@ -1864,7 +1959,7 @@ mod test {
     }
 
     #[test]
-    fn test_add_constraint_edges_single() -> Result<(), InsertionError> {
+    fn test_add_constraint_edges_single() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
 
         cdt.add_constraint_edges([Point2::new(1.0, 1.0)], true)?;
@@ -1877,7 +1972,7 @@ mod test {
     }
 
     #[test]
-    fn test_add_constraint_edges_duplicate() -> Result<(), InsertionError> {
+    fn test_add_constraint_edges_duplicate() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         let point = Point2::new(0.0, 1.0);
         cdt.add_constraint_edges([point, point], true)?;
@@ -1905,7 +2000,7 @@ mod test {
     }
 
     #[test]
-    fn test_cdt_edge_split_degenerate() -> Result<(), InsertionError> {
+    fn test_cdt_edge_split_degenerate() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         cdt.add_constraint_edge(Point2::new(-10.0, -10.0), Point2::new(20.0, -10.0))?;
         cdt.insert(Point2::new(0.0, -10.0))?;
@@ -1967,8 +2062,8 @@ mod test {
         for (p1, p2) in edges {
             let p1 = triangulation.insert(p1)?;
             let p2 = triangulation.insert(p2)?;
-            assert!(triangulation.can_add_constraint(p1, p2));
-            triangulation.add_constraint(p1, p2);
+            assert!(triangulation.can_add_constraint(p1, p2).unwrap());
+            triangulation.add_constraint(p1, p2).unwrap();
         }
 
         triangulation.insert(start)?;
@@ -1998,7 +2093,7 @@ mod test {
             let a = cdt.insert(a)?;
             let b = cdt.insert(b)?;
 
-            cdt.add_constraint_and_split(a, b, |v| v);
+            cdt.add_constraint_and_split(a, b, |v| v).unwrap();
         }
 
         // This insertion used to fail as the position could not be located
@@ -2006,7 +2101,7 @@ mod test {
         Ok(())
     }
 
-    fn get_cdt_for_try_add_constraint() -> Result<Cdt, InsertionError> {
+    fn get_cdt_for_try_add_constraint() -> Result<Cdt, BulkLoadCdtError> {
         let vertices = vec![
             Point2::new(0.0, -10.0),
             Point2::new(76.0, 0.0),
@@ -2023,7 +2118,7 @@ mod test {
     }
 
     #[test]
-    fn get_try_cdt_for_duplicate_vertices() -> Result<(), InsertionError> {
+    fn get_try_cdt_for_duplicate_vertices() -> Result<(), BulkLoadCdtError> {
         let vertices = vec![
             Point2::new(0.0, -10.0),
             Point2::new(76.0, 0.0),
@@ -2046,7 +2141,7 @@ mod test {
     }
 
     #[test]
-    fn test_single_split() -> Result<(), InsertionError> {
+    fn test_single_split() -> Result<(), BulkLoadCdtError> {
         let vertices = vec![
             Point2::new(-1.0, 0.0),
             Point2::new(1.0, 0.0),
@@ -2057,10 +2152,10 @@ mod test {
         let mut cdt = Cdt::bulk_load_cdt(vertices, vec![[2, 3]])?;
 
         let initial_num_vertices = cdt.num_vertices();
-        let from = FixedVertexHandle::from_index(0);
-        let to = FixedVertexHandle::from_index(1);
+        let from = FixedVertexHandle::from_index(0).unwrap();
+        let to = FixedVertexHandle::from_index(1).unwrap();
 
-        let edges = cdt.add_constraint_and_split(from, to, |v| v);
+        let edges = cdt.add_constraint_and_split(from, to, |v| v).unwrap();
 
         assert_eq!(cdt.num_vertices(), initial_num_vertices + 1);
         assert_eq!(edges.len(), 2);
@@ -2070,14 +2165,14 @@ mod test {
     }
 
     #[test]
-    fn test_multiple_splits() -> Result<(), InsertionError> {
+    fn test_multiple_splits() -> Result<(), BulkLoadCdtError> {
         let mut cdt = get_cdt_for_try_add_constraint()?;
 
         let initial_num_vertices = cdt.num_vertices();
-        let from = FixedVertexHandle::from_index(0);
-        let to = FixedVertexHandle::from_index(1);
+        let from = FixedVertexHandle::from_index(0).unwrap();
+        let to = FixedVertexHandle::from_index(1).unwrap();
 
-        let edges = cdt.add_constraint_and_split(from, to, |v| v);
+        let edges = cdt.add_constraint_and_split(from, to, |v| v).unwrap();
 
         // 3 new points should be added as the constraint intersects all 3 existing edges
         assert_eq!(cdt.num_vertices(), initial_num_vertices + 3);
@@ -2088,32 +2183,32 @@ mod test {
     }
 
     #[test]
-    fn test_try_add_constraint() -> Result<(), InsertionError> {
+    fn test_try_add_constraint() -> Result<(), BulkLoadCdtError> {
         let mut cdt = get_cdt_for_try_add_constraint()?;
 
         let initial_num_vertices = cdt.num_vertices();
         let initial_num_constraints = cdt.num_constraints();
-        let from = FixedVertexHandle::from_index(0);
-        let to = FixedVertexHandle::from_index(1);
+        let from = FixedVertexHandle::from_index(0).unwrap();
+        let to = FixedVertexHandle::from_index(1).unwrap();
 
-        // Is expected to fail (return an empty list)
+        // Is expected to fail
         let edges = cdt.try_add_constraint(from, to);
-        assert_eq!(edges, Vec::new());
+        assert_eq!(edges, Err(AddConstraintError::IntersectsConstraintEdge));
         assert_eq!(cdt.num_vertices(), initial_num_vertices);
         assert_eq!(cdt.num_constraints(), initial_num_constraints);
 
-        let from = FixedVertexHandle::from_index(2);
-        let to = FixedVertexHandle::from_index(3);
+        let from = FixedVertexHandle::from_index(2).unwrap();
+        let to = FixedVertexHandle::from_index(3).unwrap();
 
         // Try to add on top of an existing edge
-        let edges = cdt.try_add_constraint(from, to);
+        let edges = cdt.try_add_constraint(from, to).unwrap();
         assert_eq!(edges.len(), 1);
 
         Ok(())
     }
 
     #[test]
-    fn test_remove_vertex_respects_constraints() -> Result<(), InsertionError> {
+    fn test_remove_vertex_respects_constraints() -> Result<(), BulkLoadCdtError> {
         let mut triangulation = ConstrainedDelaunayTriangulation::<Point2<f32>>::bulk_load_cdt(
             vec![
                 Point2::new(-1.0, 0.0),
@@ -2126,17 +2221,21 @@ mod test {
 
         let mut copy = triangulation.clone();
 
-        triangulation.remove(FixedVertexHandle::from_index(1));
+        triangulation
+            .remove(FixedVertexHandle::from_index(1).unwrap())
+            .unwrap();
         triangulation.cdt_sanity_check();
 
-        copy.locate_and_remove(Point2::new(0.0, 0.0));
+        copy.locate_and_remove(Point2::new(0.0, 0.0))
+            .unwrap()
+            .unwrap();
         copy.cdt_sanity_check();
 
         Ok(())
     }
 
     #[test]
-    fn test_remove_constraint_edge() -> Result<(), InsertionError> {
+    fn test_remove_constraint_edge() -> Result<(), BulkLoadCdtError> {
         let mut cdt = get_cdt_for_try_add_constraint()?;
         for edge in cdt.fixed_undirected_edges() {
             cdt.remove_constraint_edge(edge);
@@ -2144,10 +2243,12 @@ mod test {
         assert_eq!(cdt.num_constraints, 0);
         cdt.sanity_check();
 
-        let added_edges = cdt.try_add_constraint(
-            FixedVertexHandle::from_index(0),
-            FixedVertexHandle::from_index(1),
-        );
+        let added_edges = cdt
+            .try_add_constraint(
+                FixedVertexHandle::from_index(0).unwrap(),
+                FixedVertexHandle::from_index(1).unwrap(),
+            )
+            .unwrap();
         assert_eq!(added_edges.len(), 1);
 
         assert!(cdt.remove_constraint_edge(added_edges.first().unwrap().as_undirected()));
@@ -2197,7 +2298,8 @@ mod test {
             let point_a = cdt.insert(edge[0])?;
             let point_b = cdt.insert(edge[1])?;
             cdt.cdt_sanity_check();
-            cdt.add_constraint_and_split(point_a, point_b, |v| v);
+            cdt.add_constraint_and_split(point_a, point_b, |v| v)
+                .unwrap();
             cdt.cdt_sanity_check();
         }
 
@@ -2237,8 +2339,11 @@ mod test {
         for edge in edges {
             let point_a = cdt.insert(edge[0])?;
             let point_b = cdt.insert(edge[1])?;
-            returned_constraint_edge_counts
-                .push(cdt.add_constraint_and_split(point_a, point_b, |v| v).len());
+            returned_constraint_edge_counts.push(
+                cdt.add_constraint_and_split(point_a, point_b, |v| v)
+                    .unwrap()
+                    .len(),
+            );
             cdt.cdt_sanity_check();
         }
 
@@ -2339,7 +2444,8 @@ mod test {
         for edge in edges {
             let point_a = cdt.insert(edge.0).unwrap();
             let point_b = cdt.insert(edge.1).unwrap();
-            cdt.add_constraint_and_split(point_a, point_b, |v| v);
+            cdt.add_constraint_and_split(point_a, point_b, |v| v)
+                .unwrap();
             cdt.cdt_sanity_check();
         }
     }
@@ -2362,16 +2468,16 @@ mod test {
             cdt.insert(point)?;
         }
 
-        let v = |n| FixedVertexHandle::from_index(n);
+        let v = |n| FixedVertexHandle::from_index(n).unwrap();
 
-        cdt.add_constraint(v(0), v(4));
-        cdt.add_constraint(v(1), v(6));
-        cdt.add_constraint(v(2), v(7));
-        cdt.add_constraint(v(3), v(4));
-        cdt.add_constraint(v(4), v(5));
-        cdt.add_constraint(v(5), v(6));
-        cdt.add_constraint(v(7), v(3));
-        cdt.add_constraint(v(6), v(7));
+        cdt.add_constraint(v(0), v(4)).unwrap();
+        cdt.add_constraint(v(1), v(6)).unwrap();
+        cdt.add_constraint(v(2), v(7)).unwrap();
+        cdt.add_constraint(v(3), v(4)).unwrap();
+        cdt.add_constraint(v(4), v(5)).unwrap();
+        cdt.add_constraint(v(5), v(6)).unwrap();
+        cdt.add_constraint(v(7), v(3)).unwrap();
+        cdt.add_constraint(v(6), v(7)).unwrap();
 
         cdt.cdt_sanity_check();
         Ok(())
@@ -2402,7 +2508,9 @@ mod test {
         for &(x, y) in points {
             let next_handle = cdt.insert(Point2::new(x, y))?;
             if let Some(last_handle) = last_handle {
-                let edges = cdt.add_constraint_and_split(last_handle, next_handle, |p| p);
+                let edges = cdt
+                    .add_constraint_and_split(last_handle, next_handle, |p| p)
+                    .unwrap();
                 if !edges.is_empty() {
                     check_returned_edges(&cdt, &edges, last_handle, next_handle);
                 }
@@ -2652,7 +2760,7 @@ mod test {
             for (x, y) in points {
                 let next_handle = cdt.insert(Point2::new(x,y)).unwrap();
                 if let Some(last_handle) = last_handle {
-                    let edges = cdt.add_constraint_and_split(last_handle, next_handle, |p|p);
+                    let edges = cdt.add_constraint_and_split(last_handle, next_handle, |p|p).unwrap();
                     if !edges.is_empty() {
                         check_returned_edges(&cdt, &edges, last_handle, next_handle);
                     }
@@ -2662,5 +2770,60 @@ mod test {
             }
 
         }
+    }
+
+    #[test]
+    fn test_bulk_load_cdt_errors() {
+        let vertices = vec![
+            Point2::new(-1.0, 0.0),
+            Point2::new(1.0, 0.0),
+            Point2::new(0.0, -1.0),
+            Point2::new(0.0, 1.0),
+        ];
+
+        assert_eq!(
+            Cdt::bulk_load_cdt(vertices.clone(), vec![[0, 4]]).err(),
+            Some(BulkLoadCdtError::InvalidEdgeIndex([0, 4]))
+        );
+        assert!(matches!(
+            Cdt::try_bulk_load_cdt(vertices.clone(), vec![[7, 1]], |_| {}),
+            Err(BulkLoadCdtError::InvalidEdgeIndex([7, 1]))
+        ));
+        assert!(matches!(
+            Cdt::bulk_load_cdt(vertices.clone(), vec![[0, 1], [2, 3]]),
+            Err(BulkLoadCdtError::ConflictingEdge(_))
+        ));
+        assert!(matches!(
+            Cdt::bulk_load_cdt(vec![Point2::new(f64::NAN, 0.0)], vec![]),
+            Err(BulkLoadCdtError::Insertion(InsertionError::NAN))
+        ));
+    }
+
+    #[test]
+    fn test_constraint_queries() -> Result<(), AddConstraintError> {
+        use crate::QueryError;
+
+        let mut cdt = Cdt::new();
+        let v0 = cdt.insert(Point2::new(-1.0, 0.0))?;
+        let v1 = cdt.insert(Point2::new(1.0, 0.0))?;
+        let v2 = cdt.insert(Point2::new(0.0, -1.0))?;
+        let v3 = cdt.insert(Point2::new(0.0, 1.0))?;
+        cdt.add_constraint(v0, v1)?;
+
+        assert!(!cdt.can_add_constraint(v2, v3)?);
+        assert!(cdt.intersects_constraint(Point2::new(0.0, -1.0), Point2::new(0.0, 1.0))?);
+        assert_eq!(
+            cdt.intersects_constraint(Point2::new(f64::NAN, 0.0), Point2::new(0.0, 1.0)),
+            Err(QueryError::NAN)
+        );
+        assert_eq!(
+            cdt.get_conflicting_edges_between_points(
+                Point2::new(0.0, -1.0),
+                Point2::new(0.0, 1.0)
+            )?
+            .count(),
+            1
+        );
+        Ok(())
     }
 }

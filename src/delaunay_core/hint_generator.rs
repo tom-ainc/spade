@@ -156,6 +156,10 @@ pub type HierarchyHintGenerator<S> = HierarchyHintGeneratorWithBranchFactor<S, 1
 pub struct HierarchyHintGeneratorWithBranchFactor<S: SpadeNum, const BRANCH_FACTOR: u32> {
     hierarchy: Vec<DelaunayTriangulation<Point2<S>>>,
     num_elements_of_base_triangulation: usize,
+    /// Set if updating the hierarchy failed. The hierarchy is cleared and no longer updated in
+    /// this case. Hints are only used to speed up lookups, so this only affects performance.
+    #[cfg_attr(feature = "serde", serde(default))]
+    degraded: bool,
 }
 
 impl<S: SpadeNum, const BRANCH_FACTOR: u32> Default
@@ -165,7 +169,19 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> Default
         Self {
             hierarchy: Vec::new(),
             num_elements_of_base_triangulation: 0,
+            degraded: false,
         }
+    }
+}
+
+impl<S: SpadeNum, const BRANCH_FACTOR: u32>
+    HierarchyHintGeneratorWithBranchFactor<S, BRANCH_FACTOR>
+{
+    /// Gives up on maintaining the hierarchy after an internal error.
+    fn degrade(&mut self) {
+        debug_assert!(false, "Failed to update hint hierarchy. This is a bug.");
+        self.hierarchy.clear();
+        self.degraded = true;
     }
 }
 
@@ -175,7 +191,11 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
     fn get_hint(&self, position: Point2<S>) -> FixedVertexHandle {
         let mut nearest = FixedVertexHandle::new(0);
         for layer in self.hierarchy.iter().rev().skip(1) {
-            nearest = layer.walk_to_nearest_neighbor(nearest, position).fix();
+            if layer.num_vertices() == 0 {
+                break;
+            }
+            let start = layer.validate_vertex_handle(nearest);
+            nearest = layer.walk_to_nearest_neighbor(start, position).fix();
             let hint_generator: &LastUsedVertexHintGenerator = layer.hint_generator();
             <LastUsedVertexHintGenerator as HintGenerator<S>>::notify_vertex_lookup(
                 hint_generator,
@@ -189,6 +209,9 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
     fn notify_vertex_lookup(&self, _: FixedVertexHandle) {}
 
     fn notify_vertex_inserted(&mut self, vertex: FixedVertexHandle, vertex_position: Point2<S>) {
+        if self.degraded {
+            return;
+        }
         self.num_elements_of_base_triangulation += 1;
 
         // Find first layer to insert into. Insert into all higher layers.
@@ -200,7 +223,9 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
             index /= BRANCH_FACTOR;
 
             if remainder == 0 {
-                triangulation.insert(vertex_position).unwrap();
+                if triangulation.insert(vertex_position).is_err() {
+                    return self.degrade();
+                }
             } else {
                 break;
             }
@@ -211,9 +236,12 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
             let position_of_vertex_0 = self
                 .hierarchy
                 .first()
-                .map(|layer| layer.vertex(FixedVertexHandle::new(0)).position())
+                .and_then(|layer| layer.get_vertex(FixedVertexHandle::new(0)))
+                .map(|vertex| vertex.position())
                 .unwrap_or(vertex_position);
-            new_layer.insert(position_of_vertex_0).unwrap();
+            if new_layer.insert(position_of_vertex_0).is_err() {
+                return self.degrade();
+            }
             self.hierarchy.push(new_layer);
         }
     }
@@ -224,6 +252,9 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
         vertex: FixedVertexHandle,
         _vertex_position: Point2<S>,
     ) {
+        if self.degraded {
+            return;
+        }
         if self.num_elements_of_base_triangulation == 1 {
             // Special case: Triangulation has become empty
             *self = Default::default();
@@ -244,15 +275,22 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
             if remainder == 0 {
                 // The current handle is part of this layer and must be removed.
                 if let Some(swapped_point) = swapped_in_point.as_ref() {
-                    if (triangulation.num_vertices() - 1) * (BRANCH_FACTOR as usize)
+                    if triangulation.num_vertices().saturating_sub(1) * (BRANCH_FACTOR as usize)
                         != last_layer_size
                     {
                         // Only insert a new element if the swapped element is not already present
                         // in the layer
-                        triangulation.insert(*swapped_point).unwrap();
+                        if triangulation.insert(*swapped_point).is_err() {
+                            return self.degrade();
+                        }
                     }
                 }
-                triangulation.remove(FixedVertexHandle::new(index_to_remove as usize));
+                if triangulation
+                    .remove(FixedVertexHandle::new(index_to_remove as usize))
+                    .is_err()
+                {
+                    return self.degrade();
+                }
             }
 
             let prev_num_vertices = last_layer_size as u32;
@@ -261,7 +299,9 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
                 // The layer contains too many elements. Remove the last.
                 let vertex_to_pop = FixedVertexHandle::new(triangulation.num_vertices() - 1);
                 swapped_in_point = None;
-                triangulation.remove(vertex_to_pop);
+                if triangulation.remove(vertex_to_pop).is_err() {
+                    return self.degrade();
+                }
             }
 
             last_layer_size = triangulation.num_vertices();
@@ -294,10 +334,13 @@ impl<S: SpadeNum, const BRANCH_FACTOR: u32> HintGenerator<S>
                 .step_by(current_step)
                 .collect::<Vec<_>>();
 
-            result.hierarchy.push(
-                DelaunayTriangulation::bulk_load_stable(vertices)
-                    .expect("Failed to load hierarchy layer."),
-            );
+            match DelaunayTriangulation::bulk_load_stable(vertices) {
+                Ok(layer) => result.hierarchy.push(layer),
+                Err(_) => {
+                    result.degrade();
+                    return result;
+                }
+            }
 
             if current_step >= triangulation.num_vertices() {
                 break;
@@ -371,7 +414,7 @@ mod test {
                     assert_eq!(layer.vertex(corresponding_vertex).position(), position);
                     power *= BRANCH_FACTOR;
                 } else {
-                    assert!(layer.locate_vertex(position).is_none());
+                    assert!(layer.locate_vertex(position).unwrap().is_none());
                 }
             }
         }
@@ -412,7 +455,7 @@ mod test {
             .collect::<Vec<_>>()
             .choose(&mut rng)
         {
-            triangulation.remove(*to_remove);
+            triangulation.remove(*to_remove).unwrap();
             hierarchy_sanity_check(&triangulation);
         }
         Ok(())

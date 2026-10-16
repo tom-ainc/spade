@@ -549,10 +549,10 @@ pub fn cdt_scenario() -> Sketch {
     let v2 = cdt.insert(VertexType::new(-35.0, -35.0)).unwrap();
     let v3 = cdt.insert(VertexType::new(-35.0, 35.0)).unwrap();
 
-    cdt.add_constraint(v0, v1);
-    cdt.add_constraint(v1, v2);
-    cdt.add_constraint(v2, v3);
-    cdt.add_constraint(v3, v0);
+    cdt.add_constraint(v0, v1).unwrap();
+    cdt.add_constraint(v1, v2).unwrap();
+    cdt.add_constraint(v2, v3).unwrap();
+    cdt.add_constraint(v3, v0).unwrap();
 
     for edge in cdt.fixed_undirected_edges() {
         if cdt.is_constraint_edge(edge) {
@@ -930,10 +930,15 @@ pub fn shape_iterator_scenario(use_circle_metric: bool, iterate_vertices: bool) 
     let mut vertices = Vec::new();
     let mut edges = Vec::new();
     match (use_circle_metric, iterate_vertices) {
-        (true, true) => vertices = t.get_vertices_in_circle(center, radius_2).collect(),
-        (true, false) => edges = t.get_edges_in_circle(center, radius_2).collect(),
-        (false, true) => vertices = t.get_vertices_in_rectangle(lower, upper).collect(),
-        (false, false) => edges = t.get_edges_in_rectangle(lower, upper).collect(),
+        (true, true) => {
+            vertices = t
+                .get_vertices_in_circle(center, radius_2)
+                .unwrap()
+                .collect()
+        }
+        (true, false) => edges = t.get_edges_in_circle(center, radius_2).unwrap().collect(),
+        (false, true) => vertices = t.get_vertices_in_rectangle(lower, upper).unwrap().collect(),
+        (false, false) => edges = t.get_edges_in_rectangle(lower, upper).unwrap().collect(),
     }
 
     let mut result = convert_triangulation(&t, &Default::default());
@@ -989,7 +994,7 @@ pub fn natural_neighbors_scenario() -> Sketch {
 
     let mut nns = Vec::new();
     let query_point = spade::Point2::new(-1.0, 4.0);
-    nn.get_weights(query_point, &mut nns);
+    nn.get_weights(query_point, &mut nns).unwrap();
 
     let mut result = convert_triangulation(&triangulation, &Default::default());
 
@@ -1072,7 +1077,7 @@ pub fn natural_neighbor_area_scenario(include_faces: bool) -> Result<Sketch> {
     let mut nns = Vec::new();
     triangulation
         .natural_neighbor()
-        .get_weights(query_vertex.position(), &mut nns);
+        .get_weights(query_vertex.position(), &mut nns)?;
 
     for (vertex, _) in &nns {
         triangulation.vertex_data_mut(*vertex).color = Some(SketchColor::CRIMSON);
@@ -1236,7 +1241,7 @@ pub fn refinement_scenario(do_refine: bool) -> Sketch {
     let parameters = RefinementParameters::default();
 
     if do_refine {
-        cdt.refine(parameters);
+        cdt.refine(parameters).unwrap();
     }
 
     convert_refinement_cdt(&mut cdt)
@@ -1251,7 +1256,7 @@ pub fn exclude_outer_faces_scenario(do_refine: bool) -> Sketch {
         .exclude_outer_faces(true)
         .with_max_additional_vertices(num_additional_vertices);
 
-    let result = cdt.refine(parameters);
+    let result = cdt.refine(parameters).unwrap();
     for face in &result.excluded_faces {
         cdt.face_data_mut(*face).fill = SketchFill::solid(SketchColor::TAN);
     }
@@ -1341,7 +1346,8 @@ pub fn angle_limit_scenario(angle_limit_degrees: f64) -> Sketch {
 
     cdt.refine(
         RefinementParameters::default().with_angle_limit(AngleLimit::from_deg(angle_limit_degrees)),
-    );
+    )
+    .unwrap();
     let mut result = convert_refinement_cdt(&mut cdt);
     result.set_width(200);
     result
@@ -1374,7 +1380,8 @@ pub fn refinement_maximum_area_scenario(max_area: Option<f64>) -> Sketch {
     let triangulation = big_triangulation().unwrap();
     let mut cdt = Cdt::from(triangulation);
 
-    cdt.refine(RefinementParameters::default().with_max_allowed_area(max_area.unwrap_or(2000.)));
+    cdt.refine(RefinementParameters::default().with_max_allowed_area(max_area.unwrap_or(2000.)))
+        .unwrap();
 
     let mut result = convert_refinement_cdt(&mut cdt);
 
@@ -1433,7 +1440,7 @@ pub fn line_intersection_iterator_scenario() -> Result<Sketch> {
         &triangulation,
         spade::Point2::new(-30.0, 0.0),
         spade::Point2::new(40.0, 0.0),
-    ) {
+    )? {
         match intersection {
             EdgeIntersection(edge) => {
                 let [from, to] = edge.positions().map(convert_point);
@@ -1530,7 +1537,7 @@ pub fn try_add_constraint_scenario(scenario: TryAddConstraintScenario) -> Result
     match scenario {
         TryAddConstraintScenario::BaseCdt => {}
         TryAddConstraintScenario::SplitAll => {
-            cdt.add_constraint_and_split(v(0), v(1), |pos| pos.into());
+            cdt.add_constraint_and_split(v(0)?, v(1)?, |pos| pos.into())?;
         }
     }
 
@@ -1541,7 +1548,7 @@ pub fn try_add_constraint_scenario(scenario: TryAddConstraintScenario) -> Result
     }
 
     let mut new_edges = Vec::new();
-    for intersection in LineIntersectionIterator::new_from_handles(&cdt, v(0), v(1)) {
+    for intersection in LineIntersectionIterator::new_from_handles(&cdt, v(0)?, v(1)?) {
         if let Intersection::EdgeOverlap(e) = intersection {
             new_edges.push(e.fix().as_undirected())
         }

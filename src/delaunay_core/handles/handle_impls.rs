@@ -410,25 +410,9 @@ where
         &self,
         other_from: Point2<V::Scalar>,
         other_to: Point2<V::Scalar>,
-    ) -> bool {
-        let other_from_query = self.side_query(other_from);
-        let other_to_query = self.side_query(other_to);
-        let self_from_query = math::side_query(other_from, other_to, self.from().position());
-        let self_to_query = math::side_query(other_from, other_to, self.to().position());
-
-        assert!(
-            ![
-                &other_from_query,
-                &other_to_query,
-                &self_from_query,
-                &self_to_query
-            ]
-            .iter()
-            .all(|q| q.is_on_line()),
-            "intersects_edge_non_collinear: Given edge is collinear."
-        );
-
-        other_from_query != other_to_query && self_from_query != self_to_query
+    ) -> Result<bool, crate::InternalError> {
+        let [from, to] = self.positions();
+        math::intersects_edge_non_collinear(from, to, other_from, other_to)
     }
 }
 

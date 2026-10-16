@@ -30,14 +30,16 @@ fuzz_target!(|input: (Vec<FuzzPoint>, Vec<[usize; 2]>)| {
         let from = reference_cdt
             .locate_vertex(data[from].position())
             .unwrap()
+            .unwrap()
             .fix();
         let to = reference_cdt
             .locate_vertex(data[to].position())
             .unwrap()
+            .unwrap()
             .fix();
 
-        if reference_cdt.can_add_constraint(from, to) {
-            reference_cdt.add_constraint(from, to);
+        if reference_cdt.can_add_constraint(from, to).unwrap() {
+            reference_cdt.add_constraint(from, to).unwrap();
         } else {
             last_index = index;
             break;

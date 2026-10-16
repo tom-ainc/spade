@@ -1,4 +1,4 @@
-use crate::{HasPosition, LineSideInfo, Point2, SpadeNum};
+use crate::{HasPosition, InternalError, LineSideInfo, Point2, SpadeNum};
 use num_traits::{zero, Float};
 
 /// Indicates a point's projected position relative to an edge.
@@ -12,36 +12,7 @@ pub struct PointProjection<S> {
     length_2: S,
 }
 
-/// The error type used for inserting elements into a triangulation.
-///
-/// Errors during insertion can only originate from an invalid vertex position. Vertices can
-/// be checked for validity by using [validate_vertex].
-#[derive(Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Debug, Hash)]
-pub enum InsertionError {
-    /// A coordinate value was too small.
-    ///
-    /// The absolute value of any inserted vertex coordinate must either be zero or greater
-    /// than or equal to [MIN_ALLOWED_VALUE].
-    TooSmall,
-
-    /// A coordinate value was too large.
-    ///
-    /// The absolute value of any inserted vertex coordinate must be less than or equal to
-    /// [MAX_ALLOWED_VALUE].
-    TooLarge,
-
-    /// A coordinate value was NaN.
-    NAN,
-}
-
-impl core::fmt::Display for InsertionError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        <Self as core::fmt::Debug>::fmt(self, f)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for InsertionError {}
+pub use crate::errors::InsertionError;
 
 /// The smallest allowed coordinate value greater than zero that can be inserted into Delaunay
 /// triangulations. This value is equal to 2<sup>-142</sup>.
@@ -321,7 +292,7 @@ pub(crate) fn intersects_edge_non_collinear<S>(
     to0: Point2<S>,
     from1: Point2<S>,
     to1: Point2<S>,
-) -> bool
+) -> Result<bool, InternalError>
 where
     S: SpadeNum,
 {
@@ -330,14 +301,16 @@ where
     let self_from = side_query(from1, to1, from0);
     let self_to = side_query(from1, to1, to0);
 
-    assert!(
-        ![&other_from, &other_to, &self_from, &self_to]
-            .iter()
-            .all(|q| q.is_on_line()),
-        "intersects_edge_non_collinear: Given edge is collinear."
-    );
+    if [&other_from, &other_to, &self_from, &self_to]
+        .iter()
+        .all(|q| q.is_on_line())
+    {
+        return Err(internal_error!(
+            "intersects_edge_non_collinear: Given edge is collinear. This is a bug."
+        ));
+    }
 
-    other_from != other_to && self_from != self_to
+    Ok(other_from != other_to && self_from != self_to)
 }
 
 pub fn distance_2_triangle<S>(vertices: [Point2<S>; 3], query_point: Point2<S>) -> S
@@ -555,12 +528,12 @@ mod test {
         let (f1, t1) = (Point2::new(-1.5, 1.), Point2::new(1.0, -1.5));
         let (f2, t2) = (Point2::new(0.5, 4.), Point2::new(0.5, -4.));
 
-        assert!(!intersects_edge_non_collinear(f0, t0, f1, t1));
-        assert!(!intersects_edge_non_collinear(f1, t1, f0, t0));
-        assert!(intersects_edge_non_collinear(f0, t0, f2, t2));
-        assert!(intersects_edge_non_collinear(f2, t2, f0, t0));
-        assert!(intersects_edge_non_collinear(f1, t1, f2, t2));
-        assert!(intersects_edge_non_collinear(f2, t2, f1, t1));
+        assert!(!intersects_edge_non_collinear(f0, t0, f1, t1).unwrap());
+        assert!(!intersects_edge_non_collinear(f1, t1, f0, t0).unwrap());
+        assert!(intersects_edge_non_collinear(f0, t0, f2, t2).unwrap());
+        assert!(intersects_edge_non_collinear(f2, t2, f0, t0).unwrap());
+        assert!(intersects_edge_non_collinear(f1, t1, f2, t2).unwrap());
+        assert!(intersects_edge_non_collinear(f2, t2, f1, t1).unwrap());
     }
 
     #[test]
@@ -570,26 +543,26 @@ mod test {
         // Check for intersection of one endpoint touching another edge
         let (f1, t1) = (Point2::new(0.33f64, 0.33f64), Point2::new(1.0, 0.0));
         let (f2, t2) = (Point2::new(0.33, -1.0), Point2::new(0.33, 1.0));
-        assert!(intersects_edge_non_collinear(f1, t1, f2, t2));
-        assert!(intersects_edge_non_collinear(f2, t2, f1, t1));
+        assert!(intersects_edge_non_collinear(f1, t1, f2, t2).unwrap());
+        assert!(intersects_edge_non_collinear(f2, t2, f1, t1).unwrap());
         let (f3, t3) = (Point2::new(0.0, -1.0), Point2::new(2.0, 1.0));
-        assert!(intersects_edge_non_collinear(f1, t1, f3, t3));
-        assert!(intersects_edge_non_collinear(f3, t3, f1, t1));
+        assert!(intersects_edge_non_collinear(f1, t1, f3, t3).unwrap());
+        assert!(intersects_edge_non_collinear(f3, t3, f1, t1).unwrap());
 
         // Check for intersection if only end points overlap
         let (f4, t4) = (Point2::new(0.33, 0.33), Point2::new(0.0, 2.0));
-        assert!(intersects_edge_non_collinear(f1, t1, f4, t4));
-        assert!(intersects_edge_non_collinear(f4, t4, f1, t1));
+        assert!(intersects_edge_non_collinear(f1, t1, f4, t4).unwrap());
+        assert!(intersects_edge_non_collinear(f4, t4, f1, t1).unwrap());
     }
 
     #[test]
-    #[should_panic]
+    #[cfg_attr(debug_assertions, should_panic)]
     fn test_collinear_fail() {
         use super::intersects_edge_non_collinear;
 
         let (f1, t1) = (Point2::new(1.0, 2.0), Point2::new(3.0, 3.0));
         let (f2, t2) = (Point2::new(-1.0, 1.0), Point2::new(-3.0, 0.0));
-        intersects_edge_non_collinear(f1, t1, f2, t2);
+        assert!(intersects_edge_non_collinear(f1, t1, f2, t2).is_err());
     }
 
     #[test]

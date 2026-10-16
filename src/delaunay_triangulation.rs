@@ -1,8 +1,8 @@
 use super::delaunay_core::Dcel;
 use crate::{
-    handles::VertexHandle, ConstrainedDelaunayTriangulation, HasPosition, HintGenerator,
-    InsertionError, LastUsedVertexHintGenerator, NaturalNeighbor, Point2, Triangulation,
-    TriangulationExt,
+    handles::VertexHandle, BulkLoadCdtError, ConstrainedDelaunayTriangulation, HasPosition,
+    HintGenerator, InsertionError, LastUsedVertexHintGenerator, NaturalNeighbor, Point2,
+    Triangulation, TriangulationExt,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -351,7 +351,16 @@ where
     /// # Ok(()) }
     /// ```
     pub fn bulk_load_stable(elements: Vec<V>) -> Result<Self, InsertionError> {
-        let cdt = ConstrainedDelaunayTriangulation::bulk_load_cdt(elements, vec![])?;
+        let cdt =
+            ConstrainedDelaunayTriangulation::bulk_load_cdt(elements, vec![]).map_err(|error| {
+                match error {
+                    BulkLoadCdtError::Insertion(error) => error,
+                    BulkLoadCdtError::Internal(error) => InsertionError::Internal(error),
+                    _ => InsertionError::Internal(internal_error!(
+                        "Unexpected constraint error without constraint edges. This is a bug."
+                    )),
+                }
+            })?;
         let result = Self::from_cdt(cdt);
 
         Ok(result)
@@ -362,7 +371,10 @@ where
     ) -> DelaunayTriangulation<V, DE, UE, F, L> {
         let (dcel, hint_generator, num_constraints) = cdt.into_parts();
         let dcel = dcel.map_undirected_edges(|cdt_edge| cdt_edge.deconstruct().1);
-        assert_eq!(num_constraints, 0);
+        debug_assert_eq!(
+            num_constraints, 0,
+            "Unexpected constraint edges. This is a bug."
+        );
         DelaunayTriangulation {
             dcel,
             hint_generator,
@@ -437,7 +449,11 @@ where
         hint_generator: Self::HintGenerator,
         num_constraints: usize,
     ) -> Self {
-        assert_eq!(num_constraints, 0);
+        // Constraints only exist in CDTs, all callers pass 0. The count is irrelevant otherwise.
+        debug_assert_eq!(
+            num_constraints, 0,
+            "Unexpected constraint edges. This is a bug."
+        );
         Self {
             dcel,
             hint_generator,

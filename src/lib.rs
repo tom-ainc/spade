@@ -32,6 +32,9 @@ extern crate std;
 
 extern crate alloc;
 
+#[macro_use]
+mod errors;
+
 mod cdt;
 mod delaunay_core;
 mod delaunay_triangulation;
@@ -43,6 +46,9 @@ mod triangulation;
 
 pub use crate::cdt::{CdtEdge, ConstrainedDelaunayTriangulation};
 pub use crate::delaunay_triangulation::DelaunayTriangulation;
+pub use crate::errors::{
+    AddConstraintError, BulkLoadCdtError, HandleIndexError, InternalError, QueryError, RemovalError,
+};
 pub use crate::point::{HasPosition, Point2, SpadeNum};
 
 pub use crate::delaunay_core::math::{

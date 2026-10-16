@@ -382,6 +382,7 @@ impl<V, DE, UE, F> Dcel<V, DE, UE, F> {
         }
     }
 
+    #[cfg(any(test, fuzzing))]
     pub fn sanity_check(&self) {
         if self.num_vertices() <= 1 {
             assert_eq!(self.num_faces(), 1);
