@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## Unreleased
+
+Spade no longer panics in library code. Invalid input is reported through `Result`s. Violated internal
+invariants (bugs in spade) trigger a `debug_assert!` in debug builds and are returned as `InternalError` in
+release builds.
+
+### Added
+ - Error types `AddConstraintError`, `BulkLoadCdtError`, `HandleIndexError`, `InternalError`, `QueryError` and
+   `RemovalError`.
+ - `InsertionError::TooManyVertices` and `InsertionError::Internal`. `InsertionError` is now `#[non_exhaustive]`.
+ - `LineIntersectionIterator::error` reports an internal error that ended the iteration early.
+ - `TryFrom<usize>` for `FixedVertexHandle`.
+
+### Changed
+ - **Breaking:** These functions return a `Result` instead of panicking:
+   - `ConstrainedDelaunayTriangulation::add_constraint` returns `Result<(), AddConstraintError>` instead of
+     `bool` and leaves the triangulation unchanged if the new constraint intersects an existing one.
+   - `add_constraint_edge` and `add_constraint_edges` return `AddConstraintError` instead of `InsertionError`.
+   - `try_add_constraint` returns `Result<Vec<_>, AddConstraintError>`. Intersecting an existing constraint
+     edge now returns `AddConstraintError::IntersectsConstraintEdge` instead of an empty `Vec`.
+   - `add_constraint_and_split` returns `Result<Vec<_>, AddConstraintError>`.
+   - `bulk_load_cdt` and `try_bulk_load_cdt` return `BulkLoadCdtError`, which reports conflicting and
+     out-of-range constraint edges.
+   - `Triangulation::remove` and `ConstrainedDelaunayTriangulation::remove` return
+     `Result<V, RemovalError>`, `locate_and_remove` returns `Result<Option<V>, RemovalError>`.
+   - `locate`, `locate_vertex` and `locate_with_hint` return `QueryError::NAN` for NaN positions.
+   - `get_edges_in_rectangle`, `get_edges_in_circle`, `get_vertices_in_rectangle` and
+     `get_vertices_in_circle` return `Result`. The circle variants return `QueryError::InvalidRadius` for a
+     negative or NaN radius.
+   - `can_add_constraint`, `intersects_constraint` and `get_conflicting_edges_between_points` return `Result`.
+   - `LineIntersectionIterator::new` returns `Result`.
+   - `refine` returns `Result<RefinementResult, InsertionError>` if a steiner point cannot be inserted.
+   - `Barycentric` and `NaturalNeighbor`: `get_weights`, `interpolate` and `interpolate_gradient` return
+     `Result`.
+   - `FixedVertexHandle::from_index` returns `Result<FixedVertexHandle, HandleIndexError>`.
+ - `HierarchyHintGenerator` stops maintaining its hierarchy after an internal error instead of panicking.
+   Lookups remain correct but become slower.
+ - Calling back into a `NaturalNeighbor` or `Barycentric` instance from within an interpolation closure no
+   longer panics.
+
 ## [2.15.1] - 2026-03-24
 
 ### Fixed

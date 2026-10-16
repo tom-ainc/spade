@@ -1,11 +1,11 @@
 use core::f64;
-use core::panic;
 
 use crate::delaunay_core::math;
 use crate::delaunay_core::triangulation_ext::VertexToInsert;
 use crate::{
-    ConstrainedDelaunayTriangulation, HasPosition, HintGenerator, InsertionError,
-    LastUsedVertexHintGenerator, Point2, Triangulation, TriangulationExt,
+    AddConstraintError, BulkLoadCdtError, ConstrainedDelaunayTriangulation, HasPosition,
+    HintGenerator, InsertionError, InternalError, LastUsedVertexHintGenerator, Point2,
+    Triangulation, TriangulationExt,
 };
 use core::cmp::{Ordering, Reverse};
 
@@ -26,7 +26,8 @@ use alloc::{vec, vec::Vec};
 ///
 /// This is only used as part of bulk loading.
 /// All input coordinates are checked with `validate_coordinate` before they are used, hence
-/// `Ord` and `Eq` should always be well-defined.
+/// `Ord` and `Eq` should always be well-defined. `Ord` falls back to [f64::total_cmp] to rule out
+/// panics even if a NaN value slips through.
 #[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
 struct FloatOrd<S>(S);
 
@@ -39,16 +40,14 @@ fn bulk_load_distance_fn(center: Point2<f64>, position: Point2<f64>) -> impl Ord
 }
 
 #[allow(clippy::derive_ord_xor_partial_ord)]
-impl<S> Ord for FloatOrd<S>
-where
-    S: PartialOrd,
-{
+impl Ord for FloatOrd<f64> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        self.partial_cmp(other)
+            .unwrap_or_else(|| self.0.total_cmp(&other.0))
     }
 }
 
-impl<S> Eq for FloatOrd<S> where S: PartialOrd {}
+impl Eq for FloatOrd<f64> {}
 
 /// Implements a circle-sweep bulk loading algorithm for efficient initialization of Delaunay
 /// triangulations.
@@ -99,6 +98,9 @@ where
     if elements.is_empty() {
         return Ok(T::new());
     }
+    if elements.len() > dcel_operations::MAX_VERTICES {
+        return Err(InsertionError::TooManyVertices);
+    }
 
     let mut point_sum = Point2::<f64>::new(0.0, 0.0);
 
@@ -141,10 +143,14 @@ where
             FixedVertexHandle::new(result.num_vertices() - 1),
         ];
 
-        if let Some(hull) = try_get_hull_center(&result, thee_vertices)
-            .and_then(|center| Hull::from_triangulation(&result, center))
+        if let Some(hull) = try_get_hull_center(&result, thee_vertices)?
+            .map(|center| Hull::from_triangulation(&result, center))
+            .transpose()?
+            .flatten()
         {
-            hull_sanity_check(&result, &hull);
+            if cfg!(any(fuzzing, test)) {
+                hull_sanity_check(&result, &hull);
+            }
             break hull;
         }
     };
@@ -163,17 +169,17 @@ where
             &mut hull,
             VertexToInsert::NewVertex(next),
             &mut buffer,
-        ))
+        )?)
     }
 
     if cfg!(any(fuzzing, test)) {
         hull_sanity_check(&result, &hull);
     }
 
-    fix_convexity(&mut result);
+    fix_convexity(&mut result)?;
 
     for skipped in skipped_elements {
-        result.insert_with_hint_option_impl(skipped, None);
+        result.insert_with_hint_option_impl(skipped, None)?;
     }
 
     Ok(result)
@@ -181,7 +187,8 @@ where
 
 /// Returns the [`ConstrainedDelaunayTriangulation`].
 ///
-/// Panics if it encounters any conflicting edges. See [try_bulk_load_cdt] for a non-panicking version.
+/// Returns [BulkLoadCdtError::ConflictingEdge] if it encounters any conflicting edges. See
+/// [try_bulk_load_cdt] for a version that skips conflicting edges instead.
 ///
 /// # See also
 ///
@@ -189,7 +196,7 @@ where
 pub fn bulk_load_cdt<V, DE, UE, F, L>(
     elements: Vec<V>,
     edges: Vec<[usize; 2]>,
-) -> Result<ConstrainedDelaunayTriangulation<V, DE, UE, F, L>, InsertionError>
+) -> Result<ConstrainedDelaunayTriangulation<V, DE, UE, F, L>, BulkLoadCdtError>
 where
     V: HasPosition,
     DE: Default,
@@ -197,21 +204,26 @@ where
     F: Default,
     L: HintGenerator<<V as HasPosition>::Scalar>,
 {
-    try_bulk_load_cdt(elements, edges, |e| {
-        panic!("Conflicting edge encountered: [{}, {}]", e[0], e[1])
-    })
+    let mut first_conflict = None;
+    let result = try_bulk_load_cdt(elements, edges, |e| {
+        first_conflict.get_or_insert(e);
+    })?;
+    match first_conflict {
+        Some(edge) => Err(BulkLoadCdtError::ConflictingEdge(edge)),
+        None => Ok(result),
+    }
 }
 
 /// Efficient bulk loading of a constraint delaunay triangulation, including both vertices and constraint edges.
 /// See [ConstrainedDelaunayTriangulation::bulk_load_cdt] for a related example and documentation.
 ///
-/// This function does not panic if any two constraints intersect.
+/// This function does not fail if any two constraints intersect.
 /// It will instead call `on_conflict_found` on all edges that could not be added as they intersect a previously added constraint.
 pub fn try_bulk_load_cdt<V, DE, UE, F, L>(
     mut elements: Vec<V>,
     mut edges: Vec<[usize; 2]>,
     mut on_conflict_found: impl FnMut([usize; 2]),
-) -> Result<ConstrainedDelaunayTriangulation<V, DE, UE, F, L>, InsertionError>
+) -> Result<ConstrainedDelaunayTriangulation<V, DE, UE, F, L>, BulkLoadCdtError>
 where
     V: HasPosition,
     DE: Default,
@@ -226,8 +238,18 @@ where
     //   sequentially. They remain in their original order. Then, just like the unstable variant, they are
     //   connected one at a time, beginning with the vertex closes to their average position.
 
+    if let Some(edge) = edges
+        .iter()
+        .find(|edge| edge.iter().any(|&index| index >= elements.len()))
+    {
+        return Err(BulkLoadCdtError::InvalidEdgeIndex(*edge));
+    }
+
     if elements.is_empty() {
         return Ok(ConstrainedDelaunayTriangulation::new());
+    }
+    if elements.len() > dcel_operations::MAX_VERTICES {
+        return Err(InsertionError::TooManyVertices.into());
     }
 
     let element_indices = sort_and_dedup(&mut elements, &mut edges)?;
@@ -240,7 +262,11 @@ where
         }
 
         for &[from, to] in &edges {
-            result.add_constraint(FixedVertexHandle::new(from), FixedVertexHandle::new(to));
+            match result.add_constraint(FixedVertexHandle::new(from), FixedVertexHandle::new(to)) {
+                Ok(()) => {}
+                Err(AddConstraintError::IntersectsConstraintEdge) => on_conflict_found([from, to]),
+                Err(error) => return Err(error.into()),
+            }
         }
 
         return Ok(result);
@@ -257,7 +283,8 @@ where
         |result: &mut ConstrainedDelaunayTriangulation<V, DE, UE, F>,
          edges: &mut Vec<[usize; 2]>,
          skipped_vertices: &HashSet<usize>,
-         index| {
+         index|
+         -> Result<(), BulkLoadCdtError> {
             while let Some([from, to]) = edges.last().copied() {
                 if skipped_vertices.contains(&from) || skipped_vertices.contains(&to) {
                     skipped_edges.insert([from, to]);
@@ -269,21 +296,32 @@ where
                 if from == index {
                     let [from, to] = [from, to].map(fix);
                     // Insert constraint edge
-                    if result.try_add_constraint(from, to).is_empty() {
-                        on_conflict_found([from.index(), to.index()]);
+                    match result.try_add_constraint(from, to) {
+                        Ok(_) => {}
+                        Err(AddConstraintError::IntersectsConstraintEdge) => {
+                            on_conflict_found([from.index(), to.index()])
+                        }
+                        Err(error) => return Err(error.into()),
                     }
                     edges.pop();
                 } else {
                     break;
                 }
             }
+            Ok(())
         };
 
     // Goes through all element indices, closest to farthest away
     let mut elements_iter = element_indices.iter().rev().copied();
 
-    let first = fix(elements_iter.next().unwrap());
-    let second = fix(elements_iter.next().unwrap());
+    let (Some(first), Some(second), Some(third)) = (
+        elements_iter.next(),
+        elements_iter.next(),
+        elements_iter.next(),
+    ) else {
+        return Err(internal_error!("Expected at least three vertices. This is a bug.").into());
+    };
+    let [first, second] = [first, second].map(fix);
 
     let mut result = ConstrainedDelaunayTriangulation::<V, DE, UE, F, LastUsedVertexHintGenerator>::create_with_fixed_vertices(
         elements,
@@ -291,21 +329,21 @@ where
         second,
     );
 
-    let third = result.insert_with_hint_option_impl(
-        VertexToInsert::ExistingVertex(fix(elements_iter.next().unwrap())),
-        Some(first),
-    );
+    let third = result
+        .insert_with_hint_option_impl(VertexToInsert::ExistingVertex(fix(third)), Some(first))?;
 
-    add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, first.index());
-    add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, second.index());
-    add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, third.index());
+    add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, first.index())?;
+    add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, second.index())?;
+    add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, third.index())?;
 
     let mut last_3_vertices = [first, second, third];
     let mut next_handle_to_drop = 0;
 
     let mut hull = loop {
-        if let Some(hull) = try_get_hull_center(&result, last_3_vertices)
-            .and_then(|center| Hull::from_triangulation(&result, center))
+        if let Some(hull) = try_get_hull_center(&result, last_3_vertices)?
+            .map(|center| Hull::from_triangulation(&result, center))
+            .transpose()?
+            .flatten()
         {
             break hull;
         }
@@ -317,9 +355,9 @@ where
         let next_handle = result.insert_with_hint_option_impl(
             VertexToInsert::ExistingVertex(FixedVertexHandle::new(index)),
             Some(first),
-        );
+        )?;
 
-        add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, index);
+        add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, index)?;
 
         last_3_vertices[next_handle_to_drop] = next_handle;
         next_handle_to_drop = (next_handle_to_drop + 1) % 3;
@@ -337,13 +375,13 @@ where
             &mut hull,
             VertexToInsert::ExistingVertex(FixedVertexHandle::new(next_index)),
             &mut buffer,
-        )
+        )?
         .is_some()
         {
             skipped_vertices.insert(next_index);
         }
 
-        add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, next_index);
+        add_constraints_for_new_vertex(&mut result, &mut edges, &skipped_vertices, next_index)?;
     }
 
     if cfg!(any(fuzzing, test)) {
@@ -351,24 +389,32 @@ where
     }
 
     if !require_convexity {
-        fix_convexity(&mut result);
+        fix_convexity(&mut result)?;
     }
 
     for element in skipped_vertices {
         result.insert_with_hint_option_impl(
             VertexToInsert::ExistingVertex(FixedVertexHandle::new(element)),
             Some(first),
-        );
+        )?;
     }
 
     for [from, to] in skipped_edges {
         let [from, to] = [from, to].map(FixedVertexHandle::new);
-        if result.try_add_constraint(from, to).is_empty() {
-            on_conflict_found([from.index(), to.index()]);
+        match result.try_add_constraint(from, to) {
+            Ok(_) => {}
+            Err(AddConstraintError::IntersectsConstraintEdge) => {
+                on_conflict_found([from.index(), to.index()])
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 
-    assert_eq!(edges, Vec::<[usize; 2]>::new());
+    if !edges.is_empty() {
+        return Err(
+            internal_error!("Not all constraint edges were inserted. This is a bug.").into(),
+        );
+    }
 
     Ok(result.adjust_hint_generator())
 }
@@ -491,13 +537,13 @@ where
 fn try_get_hull_center<V, T>(
     result: &T,
     three_vertices: [FixedVertexHandle; 3],
-) -> Option<Point2<f64>>
+) -> Result<Option<Point2<f64>>, InsertionError>
 where
     V: HasPosition,
     T: Triangulation<Vertex = V>,
 {
     if result.all_vertices_on_line() {
-        return None;
+        return Ok(None);
     }
 
     let zero = <V as HasPosition>::Scalar::zero();
@@ -518,11 +564,11 @@ where
     let center = Point2::new(sum_x, sum_y).mul(<V as HasPosition>::Scalar::from(1f32 / 3f32));
 
     if let crate::PositionInTriangulation::OnFace(_) =
-        result.locate_with_hint(center, three_vertices[0])
+        result.locate_with_hint(center, three_vertices[0])?
     {
-        return Some(center.to_f64());
+        return Ok(Some(center.to_f64()));
     }
-    None
+    Ok(None)
 }
 
 /// Returns `handle` if it couldn't be inserted due to precision issues.
@@ -533,7 +579,7 @@ fn single_bulk_insertion_step<TR, T>(
     hull: &mut Hull,
     handle: VertexToInsert<TR::Vertex>,
     buffer_for_edge_legalization: &mut Vec<FixedUndirectedEdgeHandle>,
-) -> Option<VertexToInsert<TR::Vertex>>
+) -> Result<Option<VertexToInsert<TR::Vertex>>, InternalError>
 where
     T: HasPosition,
     TR: Triangulation<Vertex = T>,
@@ -546,17 +592,21 @@ where
 
     let [from, to] = edge.positions();
     if next_position == from || next_position == to {
-        return None;
+        return Ok(None);
     }
 
     if edge.side_query(next_position).is_on_right_side_or_on_line() {
         // The position is, for some reason, not on the left side of the edge. This can e.g. happen
         // if the vertices have the same angle. The safest way to include these elements appears to
         // skip them and insert them individually at the end (albeit that's very slow)
-        return Some(handle);
+        return Ok(Some(handle));
     }
 
-    assert!(edge.is_outer_edge());
+    if !edge.is_outer_edge() {
+        return Err(internal_error!(
+            "Hull edge must be an outer edge. This is a bug."
+        ));
+    }
 
     let edge = edge.fix();
 
@@ -621,7 +671,7 @@ where
             buffer_for_edge_legalization.clear();
             buffer_for_edge_legalization.push(handle.as_undirected());
             buffer_for_edge_legalization.push(current_edge.as_undirected());
-            result.legalize_edges_after_removal(buffer_for_edge_legalization, |_| false);
+            result.legalize_edges_after_removal(buffer_for_edge_legalization, |_| false)?;
 
             current_edge = new_edge;
         } else {
@@ -658,7 +708,7 @@ where
             buffer_for_edge_legalization.clear();
             buffer_for_edge_legalization.push(handle.as_undirected());
             buffer_for_edge_legalization.push(next_fix.as_undirected());
-            result.legalize_edges_after_removal(buffer_for_edge_legalization, |_| false);
+            result.legalize_edges_after_removal(buffer_for_edge_legalization, |_| false)?;
 
             current_edge = new_edge;
         } else {
@@ -682,25 +732,30 @@ where
             second_angle,
             first_edge.fix(),
             second_edge.fix(),
-        );
+        )?;
 
         if cfg!(any(fuzzing, test)) {
             hull_sanity_check(result, hull);
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Makes the outer hull convex. Similar to a graham scan.
-fn fix_convexity<TR>(triangulation: &mut TR)
+fn fix_convexity<TR>(triangulation: &mut TR) -> Result<(), InternalError>
 where
     TR: Triangulation,
 {
     let mut edges_to_validate = Vec::with_capacity(2);
     let mut convex_edges: Vec<FixedDirectedEdgeHandle> = Vec::with_capacity(64);
 
-    let mut current_fixed = triangulation.outer_face().adjacent_edge().unwrap().fix();
+    let Some(current_edge) = triangulation.outer_face().adjacent_edge() else {
+        return Err(internal_error!(
+            "Outer face of a non-degenerate triangulation must have an adjacent edge. This is a bug."
+        ));
+    };
+    let mut current_fixed = current_edge.fix();
 
     loop {
         let current_handle = triangulation.directed_edge(current_fixed);
@@ -728,7 +783,7 @@ where
                 convex_edges.pop();
                 convex_edges.push(new_edge);
 
-                triangulation.legalize_edges_after_removal(&mut edges_to_validate, |_| false);
+                triangulation.legalize_edges_after_removal(&mut edges_to_validate, |_| false)?;
             } else {
                 break;
             }
@@ -738,6 +793,7 @@ where
             break;
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -748,7 +804,8 @@ struct Segment {
 
 impl Segment {
     fn new(from: FloatOrd<f64>, to: FloatOrd<f64>) -> Self {
-        assert_ne!(from, to);
+        // A degenerate segment contains every angle. That is suboptimal, but never invalid.
+        debug_assert_ne!(from, to, "Segment must not be empty. This is a bug.");
         Self { from, to }
     }
 
@@ -810,11 +867,19 @@ pub struct Hull {
 }
 
 impl Hull {
-    pub fn from_triangulation<T>(triangulation: &T, center: Point2<f64>) -> Option<Self>
+    /// Returns `Ok(None)` if no hull can be created around `center`, e.g. due to imprecision.
+    pub fn from_triangulation<T>(
+        triangulation: &T,
+        center: Point2<f64>,
+    ) -> Result<Option<Self>, InternalError>
     where
         T: Triangulation,
     {
-        assert!(!triangulation.all_vertices_on_line());
+        if triangulation.all_vertices_on_line() {
+            return Err(internal_error!(
+                "Cannot create a hull for a degenerate triangulation. This is a bug."
+            ));
+        }
 
         let hull_size = triangulation.convex_hull_size();
         let mut data = Vec::with_capacity(hull_size);
@@ -829,13 +894,13 @@ impl Hull {
             if let Some(segment) = last_segment {
                 if segment.contains_angle(angle_to) {
                     // In rare cases angle_from will be larger than angle_to due to inaccuracies.
-                    return None;
+                    return Ok(None);
                 }
             }
 
             if angle_from == angle_to || angle_from.0.is_nan() || angle_to.0.is_nan() {
                 // Should only be possible for very degenerate triangulations
-                return None;
+                return Ok(None);
             }
 
             last_segment = Some(Segment::new(angle_from, angle_to));
@@ -858,12 +923,12 @@ impl Hull {
         };
 
         const INITIAL_NUMBER_OF_BUCKETS: usize = 8;
-        result.initialize_buckets(INITIAL_NUMBER_OF_BUCKETS);
+        result.initialize_buckets(INITIAL_NUMBER_OF_BUCKETS)?;
 
-        Some(result)
+        Ok(Some(result))
     }
 
-    fn initialize_buckets(&mut self, target_size: usize) {
+    fn initialize_buckets(&mut self, target_size: usize) -> Result<(), InternalError> {
         self.buckets.clear();
         self.buckets.reserve(target_size);
 
@@ -871,12 +936,14 @@ impl Hull {
         self.buckets
             .extend(core::iter::repeat_n(INVALID, target_size));
 
-        let (first_index, current_node) = self
+        let Some((first_index, current_node)) = self
             .data
             .iter()
             .enumerate()
             .find(|(index, _)| !self.empty.contains(index))
-            .unwrap();
+        else {
+            return Err(internal_error!("Hull must not be empty. This is a bug."));
+        };
 
         let mut current_index = first_index;
         let first_bucket = self.ceiled_bucket(current_node.angle);
@@ -896,6 +963,7 @@ impl Hull {
                 break;
             }
         }
+        Ok(())
     }
 
     /// Updates the hull after the insertion of a vertex.
@@ -922,7 +990,7 @@ impl Hull {
         mut right_angle: FloatOrd<f64>,
         left_edge: FixedDirectedEdgeHandle,
         mut right_edge: FixedDirectedEdgeHandle,
-    ) {
+    ) -> Result<(), InternalError> {
         let left_bucket = self.floored_bucket(left_angle);
 
         let mut left_index = self.buckets[left_bucket];
@@ -983,7 +1051,7 @@ impl Hull {
             right: right_index,
         };
 
-        self.push_or_update_node(new_node, new_index);
+        self.push_or_update_node(new_node, new_index)?;
 
         // Update bucket entries appropriately
         let left_bucket = self.ceiled_bucket(left_angle);
@@ -993,7 +1061,7 @@ impl Hull {
         self.update_bucket_segment(left_bucket, middle_bucket, left_index);
         self.update_bucket_segment(middle_bucket, right_bucket, new_index);
 
-        self.adjust_bucket_size_if_necessary();
+        self.adjust_bucket_size_if_necessary()
     }
 
     fn get_next_index(&mut self) -> usize {
@@ -1016,13 +1084,17 @@ impl Hull {
         }
     }
 
-    fn push_or_update_node(&mut self, node: Node, index: usize) {
+    fn push_or_update_node(&mut self, node: Node, index: usize) -> Result<(), InternalError> {
         if let Some(existing_node) = self.data.get_mut(index) {
             *existing_node = node;
-        } else {
-            assert_eq!(self.data.len(), index);
+        } else if self.data.len() == index {
             self.data.push(node);
+        } else {
+            return Err(internal_error!(
+                "Hull node index must be adjacent to existing nodes. This is a bug."
+            ));
         }
+        Ok(())
     }
 
     /// Gets an edge of the hull which covers a given input angle.
@@ -1057,21 +1129,22 @@ impl Hull {
         Segment::new(node.angle, self.data[node.right].angle)
     }
 
-    fn adjust_bucket_size_if_necessary(&mut self) {
-        let size = self.data.len() - self.empty.len();
+    fn adjust_bucket_size_if_necessary(&mut self) -> Result<(), InternalError> {
+        let size = self.data.len().saturating_sub(self.empty.len());
         let num_buckets = self.buckets.len();
 
         const MIN_NUMBER_OF_BUCKETS: usize = 16;
         if num_buckets * 2 < size {
             // Too few buckets - increase bucket count
-            self.initialize_buckets(num_buckets * 2);
+            self.initialize_buckets(num_buckets * 2)?;
         } else if num_buckets > size * 4 && num_buckets > MIN_NUMBER_OF_BUCKETS {
             let new_size = num_buckets / 4;
             if new_size >= MIN_NUMBER_OF_BUCKETS {
                 // Too many buckets - shrink
-                self.initialize_buckets(new_size);
+                self.initialize_buckets(new_size)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -1144,8 +1217,8 @@ mod test {
     use crate::test_utilities::{random_points_with_seed, SEED2};
 
     use crate::{
-        ConstrainedDelaunayTriangulation, DelaunayTriangulation, InsertionError, Point2,
-        Triangulation, TriangulationExt,
+        BulkLoadCdtError, ConstrainedDelaunayTriangulation, DelaunayTriangulation, InsertionError,
+        Point2, Triangulation, TriangulationExt,
     };
 
     use super::Hull;
@@ -1233,7 +1306,7 @@ mod test {
     }
 
     #[test]
-    fn test_cdt_bulk_load_on_epsilon_grid() -> Result<(), InsertionError> {
+    fn test_cdt_bulk_load_on_epsilon_grid() -> Result<(), BulkLoadCdtError> {
         const GRID_SIZE: usize = 20;
 
         let vertices = get_epsilon_grid(GRID_SIZE);
@@ -1296,7 +1369,7 @@ mod test {
         ]
     }
 
-    fn check_bulk_load_cdt(edges: Vec<[usize; 2]>) -> Result<(), InsertionError> {
+    fn check_bulk_load_cdt(edges: Vec<[usize; 2]>) -> Result<(), BulkLoadCdtError> {
         let vertices = small_cdt_vertices();
 
         let num_constraints = edges.len();
@@ -1308,8 +1381,8 @@ mod test {
         assert_eq!(cdt.num_constraints(), num_constraints);
 
         for [from, to] in edges {
-            let from = FixedVertexHandle::from_index(from);
-            let to = FixedVertexHandle::from_index(to);
+            let from = FixedVertexHandle::from_index(from).unwrap();
+            let to = FixedVertexHandle::from_index(to).unwrap();
             assert_eq!(
                 cdt.get_edge_from_neighbors(from, to)
                     .map(|h| h.is_constraint_edge()),
@@ -1321,20 +1394,20 @@ mod test {
     }
 
     #[test]
-    fn test_cdt_bulk_load_small() -> Result<(), InsertionError> {
+    fn test_cdt_bulk_load_small() -> Result<(), BulkLoadCdtError> {
         let edges = vec![[4, 5], [5, 6], [6, 7], [7, 4]];
         check_bulk_load_cdt(edges)
     }
 
     #[test]
-    fn test_cdt_bulk_load_with_constraint_edges_in_center() -> Result<(), InsertionError> {
+    fn test_cdt_bulk_load_with_constraint_edges_in_center() -> Result<(), BulkLoadCdtError> {
         let edges = vec![[0, 1], [1, 3], [3, 2], [2, 0]];
 
         check_bulk_load_cdt(edges)
     }
 
     #[test]
-    fn test_cdt_bulk_load_with_duplicates() -> Result<(), InsertionError> {
+    fn test_cdt_bulk_load_with_duplicates() -> Result<(), BulkLoadCdtError> {
         let mut vertices = small_cdt_vertices();
         vertices.extend(small_cdt_vertices());
         let edges = vec![[0, 1], [9, 3], [11, 2], [10, 0]];
@@ -1346,7 +1419,7 @@ mod test {
     }
 
     #[test]
-    fn test_cdt_bulk_load() -> Result<(), InsertionError> {
+    fn test_cdt_bulk_load() -> Result<(), BulkLoadCdtError> {
         const SIZE: usize = 500;
         let vertices = random_points_with_seed(SIZE, SEED2);
 
@@ -1395,7 +1468,7 @@ mod test {
     }
 
     #[test]
-    fn test_empty() -> Result<(), InsertionError> {
+    fn test_empty() -> Result<(), BulkLoadCdtError> {
         let cdt =
             ConstrainedDelaunayTriangulation::<Point2<f64>>::bulk_load_cdt(Vec::new(), Vec::new())?;
         assert_eq!(cdt.num_vertices(), 0);
@@ -1457,7 +1530,9 @@ mod test {
         triangulation.insert(Point2::new(-1.0, 1.0))?; // Angle: 0.625
         triangulation.insert(Point2::new(-1.0, -1.0))?; // Angle: 0.875
 
-        let mut hull = Hull::from_triangulation(&triangulation, Point2::new(0.0, 0.0)).unwrap();
+        let mut hull = Hull::from_triangulation(&triangulation, Point2::new(0.0, 0.0))
+            .unwrap()
+            .unwrap();
         super::hull_sanity_check(&triangulation, &hull);
 
         let additional_elements = [
@@ -1475,6 +1550,7 @@ mod test {
                 VertexToInsert::NewVertex(*element),
                 &mut Vec::new(),
             )
+            .unwrap()
             .is_none());
 
             if index != 0 {
@@ -1520,11 +1596,11 @@ mod test {
         for (index, [from, to]) in edges
             .iter()
             .copied()
-            .map(|e| e.map(FixedVertexHandle::from_index))
+            .map(|e| e.map(FixedVertexHandle::new))
             .enumerate()
         {
-            if reference_cdt.can_add_constraint(from, to) {
-                reference_cdt.add_constraint(from, to);
+            if reference_cdt.can_add_constraint(from, to).unwrap() {
+                reference_cdt.add_constraint(from, to).unwrap();
             } else {
                 last_index = index;
                 break;

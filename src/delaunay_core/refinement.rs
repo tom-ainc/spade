@@ -9,14 +9,17 @@ use alloc::vec::Vec;
 use num_traits::Float;
 
 use crate::{
-    delaunay_core::{dcel_operations::append_unconnected_vertex, math},
-    CdtEdge, ConstrainedDelaunayTriangulation, HasPosition, HintGenerator, Point2,
+    delaunay_core::{
+        dcel_operations::{append_unconnected_vertex, check_vertex_capacity},
+        math,
+    },
+    CdtEdge, ConstrainedDelaunayTriangulation, HasPosition, HintGenerator, InsertionError, Point2,
     PositionInTriangulation, SpadeNum, Triangulation,
 };
 
 use super::{
     DirectedEdgeHandle, FaceHandle, FixedFaceHandle, FixedUndirectedEdgeHandle, FixedVertexHandle,
-    InnerTag, TriangulationExt, UndirectedEdgeHandle,
+    InnerTag, PossiblyOuterTag, TriangulationExt, UndirectedEdgeHandle,
 };
 
 /// Contains details about the outcome of a refinement procedure.
@@ -156,7 +159,7 @@ enum RefinementHint {
 /// ```
 /// use spade::{AngleLimit, ConstrainedDelaunayTriangulation, Point2, RefinementParameters};
 ///
-/// fn refine_cdt(cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>) {
+/// fn refine_cdt(cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>) -> Result<(), spade::InsertionError> {
 ///     let params = RefinementParameters::<f64>::new()
 ///         .exclude_outer_faces(true)
 ///         .keep_constraint_edges()
@@ -164,7 +167,8 @@ enum RefinementHint {
 ///         .with_max_allowed_area(0.5)
 ///         .with_angle_limit(AngleLimit::from_deg(25.0));
 ///
-///     cdt.refine(params);
+///     cdt.refine(params)?;
+///     Ok(())
 /// }
 /// ```
 #[derive(Debug, PartialEq, Clone)]
@@ -383,7 +387,7 @@ where
     ///     Result<ConstrainedDelaunayTriangulation<Point2<f64>>,  InsertionError>
     /// {
     ///     let mut cdt = ConstrainedDelaunayTriangulation::bulk_load(vertices)?;
-    ///     let result = cdt.refine(RefinementParameters::default());
+    ///     let result = cdt.refine(RefinementParameters::default())?;
     ///     if !result.refinement_complete {
     ///         panic!("Refinement failed - I should consider using different parameters.")
     ///     }
@@ -457,10 +461,17 @@ where
     ///
     /// Wikipedia: <https://en.wikipedia.org/wiki/Delaunay_refinement>
     ///
+    /// # Errors
     ///
+    /// Returns an [InsertionError] if a new vertex could not be inserted, e.g. as its position is too small or too
+    /// large due to loss of precision. Consider refining with fewer additional vertices in this case.
+    /// The triangulation remains valid, but its refinement is incomplete.
     #[doc(alias = "Refinement")]
     #[doc(alias = "Delaunay Refinement")]
-    pub fn refine(&mut self, parameters: RefinementParameters<V::Scalar>) -> RefinementResult {
+    pub fn refine(
+        &mut self,
+        parameters: RefinementParameters<V::Scalar>,
+    ) -> Result<RefinementResult, InsertionError> {
         use PositionInTriangulation::*;
 
         let mut excluded_faces = if parameters.exclude_outer_faces {
@@ -547,7 +558,7 @@ where
                     forcibly_split_segment,
                     &mut excluded_faces,
                     parameters.keep_constraint_edges,
-                ) {
+                )? {
                     // Re-processing the last skinny triangle only makes sense if the encroachment
                     // could actually be resolved. Otherwise, we'd retry the same failed split and
                     // potentially loop forever.
@@ -579,14 +590,14 @@ where
                             opposite_position,
                         ) {
                             // The edge is encroaching
-                            let _ = self.resolve_encroachment(
+                            self.resolve_encroachment(
                                 &mut encroached_segment_candidates,
                                 &mut skinny_triangle_candidates,
                                 &mut constraint_edge_map,
                                 segment_candidate,
                                 &mut excluded_faces,
                                 parameters.keep_constraint_edges,
-                            );
+                            )?;
                         }
                     }
                 }
@@ -642,7 +653,12 @@ where
 
                 let locate_hint = face.vertices()[0].fix();
 
-                assert!(forcibly_split_segments_buffer.is_empty());
+                if !forcibly_split_segments_buffer.is_empty() {
+                    return Err(internal_error!(
+                        "Forcibly split segments must be resolved first. This is a bug."
+                    )
+                    .into());
+                }
                 legalize_edges_buffer.clear();
 
                 // "Simulate" inserting the circumcenter by locating the insertion site and identifying which edges
@@ -651,7 +667,7 @@ where
                 //
                 // First step: fill `legalize_edges_buffer` with the initial set of edges that would need to be legalized
                 // if the triangle's circumcenter would be inserted.
-                match self.locate_with_hint(circumcenter, locate_hint) {
+                match self.locate_with_hint(circumcenter, locate_hint)? {
                     OnEdge(edge) => {
                         let edge = self.directed_edge(edge);
                         if parameters.keep_constraint_edges && edge.is_constraint_edge() {
@@ -684,7 +700,12 @@ where
                     }
                     OutsideOfConvexHull(_) => continue,
                     OnVertex(_) => continue,
-                    NoTriangulation => unreachable!(),
+                    NoTriangulation => {
+                        return Err(internal_error!(
+                            "Refined triangulation must not be empty. This is a bug."
+                        )
+                        .into())
+                    }
                 };
 
                 let mut is_encroaching = false;
@@ -709,8 +730,13 @@ where
                     }
 
                     // edge is not a fixed edge. Check if it needs to be legalized.
-                    // We've already checked that this edge is not part of the convex hull - unwrap is safe
-                    let opposite = edge.rev().opposite_position().unwrap();
+                    // We've already checked that this edge is not part of the convex hull
+                    let Some(opposite) = edge.rev().opposite_position() else {
+                        return Err(internal_error!(
+                            "Non-fixed edge must not be part of the convex hull. This is a bug."
+                        )
+                        .into());
+                    };
                     let from = edge.from().position();
                     let to = edge.to().position();
                     let should_flip =
@@ -727,9 +753,7 @@ where
 
                 if !is_encroaching {
                     // The circumcenter doesn't encroach any segment. Continue really inserting it.
-                    let new_vertex = self
-                        .insert_with_hint(circumcenter.into(), locate_hint)
-                        .expect("Failed to insert circumcenter, likely due to loss of precision. Consider refining with fewer additional vertices.");
+                    let new_vertex = self.insert_with_hint(circumcenter.into(), locate_hint)?;
 
                     // Add all new and changed faces to the skinny candidate list
                     skinny_triangle_candidates.extend(
@@ -748,10 +772,10 @@ where
             }
         }
 
-        RefinementResult {
+        Ok(RefinementResult {
             excluded_faces: excluded_faces.iter().copied().collect(),
             refinement_complete,
-        }
+        })
     }
 
     fn is_fixed_edge(edge: UndirectedEdgeHandle<V, DE, CdtEdge<UE>, F>) -> bool {
@@ -766,7 +790,7 @@ where
         encroached_edge: FixedUndirectedEdgeHandle,
         excluded_faces: &mut HashSet<FixedFaceHandle<InnerTag>>,
         keep_constraint_edges: bool,
-    ) -> bool {
+    ) -> Result<bool, InsertionError> {
         // Resolves an encroachment by splitting the encroached edge. Since this reduces the diametral circle, this will
         // eventually get rid of the encroachment completely.
         //
@@ -822,12 +846,12 @@ where
 
         let final_position = v0.position().mul(weight0).add(v1.position().mul(weight1));
         if !validate_constructed_vertex(final_position, segment) {
-            return false;
+            return Ok(false);
         }
 
         let is_constraint_edge = segment.is_constraint_edge();
         if keep_constraint_edges && is_constraint_edge {
-            return false;
+            return Ok(false);
         }
 
         let [is_left_side_excluded, is_right_side_excluded] =
@@ -840,6 +864,7 @@ where
         let segment = segment.fix();
         let (v0, v1) = (v0.fix(), v1.fix());
 
+        check_vertex_capacity(self.s(), 1)?;
         let new_vertex = append_unconnected_vertex(self.s_mut(), final_position.into());
         let [e1, e2] = self.insert_on_edge(segment, new_vertex);
         self.hint_generator_mut()
@@ -857,16 +882,26 @@ where
 
         let (h1, h2) = (self.directed_edge(e1), self.directed_edge(e2));
 
+        let mut exclude_faces = |faces: [FixedFaceHandle<PossiblyOuterTag>; 2]| {
+            for face in faces {
+                let Some(face) = face.as_inner() else {
+                    return Err(internal_error!(
+                        "Faces adjacent to an excluded face must be inner faces. This is a bug."
+                    ));
+                };
+                excluded_faces.insert(face);
+            }
+            Ok(())
+        };
+
         if is_left_side_excluded {
             // Any newly added face on the left becomes an excluded face
-            excluded_faces.insert(h1.face().fix().as_inner().unwrap());
-            excluded_faces.insert(h2.face().fix().as_inner().unwrap());
+            exclude_faces([h1.face().fix(), h2.face().fix()])?;
         }
 
         if is_right_side_excluded {
             // Any newly added face on the right becomes an excluded face
-            excluded_faces.insert(h1.rev().face().fix().as_inner().unwrap());
-            excluded_faces.insert(h2.rev().face().fix().as_inner().unwrap());
+            exclude_faces([h1.rev().face().fix(), h2.rev().face().fix()])?;
         }
 
         self.legalize_vertex(new_vertex);
@@ -893,7 +928,7 @@ where
         encroached_segments_buffer.push_back(e1.as_undirected());
         encroached_segments_buffer.push_back(e2.as_undirected());
 
-        true
+        Ok(true)
     }
 }
 
@@ -1023,8 +1058,8 @@ mod test {
     use crate::{
         handles::FixedVertexHandle,
         test_utilities::{random_points_with_seed, SEED},
-        AngleLimit, ConstrainedDelaunayTriangulation, InsertionError, Point2, RefinementParameters,
-        Triangulation as _,
+        AddConstraintError, AngleLimit, BulkLoadCdtError, ConstrainedDelaunayTriangulation,
+        InsertionError, Point2, RefinementParameters, Triangulation as _,
     };
 
     pub type Cdt = ConstrainedDelaunayTriangulation<Point2<f64>>;
@@ -1058,11 +1093,12 @@ mod test {
         let mut cdt = Cdt::bulk_load(vertices)?;
 
         let initial_num_vertices = cdt.num_vertices();
-        cdt.refine(RefinementParameters::new().with_angle_limit(limit));
+        cdt.refine(RefinementParameters::new().with_angle_limit(limit))
+            .unwrap();
 
         assert_eq!(initial_num_vertices, cdt.num_vertices());
 
-        cdt.refine(RefinementParameters::new());
+        cdt.refine(RefinementParameters::new()).unwrap();
         assert!(initial_num_vertices < cdt.num_vertices());
 
         Ok(())
@@ -1096,12 +1132,12 @@ mod test {
 
         let mut peekable = cdt.fixed_vertices().peekable();
         while let (Some(p0), Some(p1)) = (peekable.next(), peekable.peek()) {
-            if !cdt.can_add_constraint(p0, *p1) {
-                cdt.add_constraint(p0, *p1);
+            if !cdt.can_add_constraint(p0, *p1).unwrap() {
+                cdt.add_constraint(p0, *p1).unwrap();
             }
         }
 
-        cdt.refine(Default::default());
+        cdt.refine(Default::default()).unwrap();
 
         cdt.cdt_sanity_check_with_params(false);
 
@@ -1109,7 +1145,7 @@ mod test {
     }
 
     #[test]
-    fn test_sharp_angle_refinement() -> Result<(), InsertionError> {
+    fn test_sharp_angle_refinement() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
 
         // This sharp angle should only be subdivided once rather than infinitely often.
@@ -1120,7 +1156,7 @@ mod test {
             .with_max_additional_vertices(10)
             .with_angle_limit(AngleLimit::from_radius_to_shortest_edge_ratio(1.0));
 
-        let result = cdt.refine(refinement_parameters);
+        let result = cdt.refine(refinement_parameters).unwrap();
 
         assert!(result.refinement_complete);
         cdt.cdt_sanity_check();
@@ -1128,7 +1164,7 @@ mod test {
     }
 
     #[test]
-    fn test_simple_exclude_outer_faces() -> Result<(), InsertionError> {
+    fn test_simple_exclude_outer_faces() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         let vertices = [
             Point2::new(-1.0, 1.0),
@@ -1147,8 +1183,16 @@ mod test {
 
         let excluded_faces = super::calculate_outer_faces(&cdt);
 
-        let v2 = cdt.locate_vertex(Point2::new(1.0, 1.0)).unwrap().fix();
-        let v0 = cdt.locate_vertex(Point2::new(-1.0, 1.0)).unwrap().fix();
+        let v2 = cdt
+            .locate_vertex(Point2::new(1.0, 1.0))
+            .unwrap()
+            .unwrap()
+            .fix();
+        let v0 = cdt
+            .locate_vertex(Point2::new(-1.0, 1.0))
+            .unwrap()
+            .unwrap()
+            .fix();
 
         let excluded_face = cdt
             .get_edge_from_neighbors(v2, v0)
@@ -1176,7 +1220,7 @@ mod test {
     }
 
     #[test]
-    fn test_exclude_outer_faces() -> Result<(), InsertionError> {
+    fn test_exclude_outer_faces() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
 
         let scale_factors = [1.0, 2.0, 3.0, 4.0];
@@ -1200,30 +1244,33 @@ mod test {
     }
 
     #[test]
-    fn test_exclude_outer_faces_with_non_closed_mesh() -> Result<(), InsertionError> {
+    fn test_exclude_outer_faces_with_non_closed_mesh() -> Result<(), AddConstraintError> {
         let mut cdt = Cdt::new();
         cdt.add_constraint_edges(test_shape(), false)?;
 
-        let refinement_result = cdt.refine(
-            RefinementParameters::new()
-                .exclude_outer_faces(true)
-                .with_angle_limit(AngleLimit::from_radius_to_shortest_edge_ratio(
-                    f64::INFINITY,
-                )),
-        );
+        let refinement_result = cdt
+            .refine(
+                RefinementParameters::new()
+                    .exclude_outer_faces(true)
+                    .with_angle_limit(AngleLimit::from_radius_to_shortest_edge_ratio(
+                        f64::INFINITY,
+                    )),
+            )
+            .unwrap();
 
         assert_eq!(
             refinement_result.excluded_faces.len(),
             cdt.num_inner_faces()
         );
 
-        cdt.refine(RefinementParameters::new().exclude_outer_faces(true));
+        cdt.refine(RefinementParameters::new().exclude_outer_faces(true))
+            .unwrap();
 
         Ok(())
     }
 
     #[test]
-    fn test_failing_refinement() -> Result<(), InsertionError> {
+    fn test_failing_refinement() -> Result<(), AddConstraintError> {
         // f32 is important - only then, rounding errors will lead to violating the ccw property when
         // the refinement splits an edge. See issue #96
         let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f32>>::new();
@@ -1247,14 +1294,14 @@ mod test {
             cdt.add_constraint_edge(start, end)?;
         }
 
-        cdt.refine(Default::default());
+        cdt.refine(Default::default()).unwrap();
         cdt.cdt_sanity_check();
 
         Ok(())
     }
 
     #[test]
-    fn repro_refine_hang_regression() -> Result<(), InsertionError> {
+    fn repro_refine_hang_regression() -> Result<(), BulkLoadCdtError> {
         let points = repro_refine_hang_points();
         let constraints = repro_refine_hang_constraints();
 
@@ -1262,20 +1309,23 @@ mod test {
 
         for edge in &constraints {
             cdt.add_constraint_and_split(
-                FixedVertexHandle::from_index(edge[0]),
-                FixedVertexHandle::from_index(edge[1]),
+                FixedVertexHandle::from_index(edge[0]).unwrap(),
+                FixedVertexHandle::from_index(edge[1]).unwrap(),
                 |v| v,
-            );
+            )
+            .unwrap();
         }
 
         let initial_num_constraints = cdt.num_constraints();
 
-        let result = cdt.refine(
-            RefinementParameters::<f64>::new()
-                .keep_constraint_edges()
-                .with_max_allowed_area(0.4 * 0.32 * 0.32)
-                .with_max_additional_vertices(1_000_000),
-        );
+        let result = cdt
+            .refine(
+                RefinementParameters::<f64>::new()
+                    .keep_constraint_edges()
+                    .with_max_allowed_area(0.4 * 0.32 * 0.32)
+                    .with_max_additional_vertices(1_000_000),
+            )
+            .unwrap();
 
         assert!(
             result.refinement_complete,

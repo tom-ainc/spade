@@ -1,4 +1,4 @@
-use crate::RemovalResult;
+use crate::{InsertionError, InternalError, RemovalResult};
 
 use super::dcel::{Dcel, EdgeEntry, FaceEntry, HalfEdgeEntry, VertexEntry};
 use super::handles::*;
@@ -8,6 +8,23 @@ use smallvec::SmallVec;
 use alloc::{vec, vec::Vec};
 
 pub const OUTER_FACE_HANDLE: FixedFaceHandle<PossiblyOuterTag> = new_fixed_face_handle(0);
+
+/// The maximum number of vertices a triangulation can hold.
+///
+/// A triangulation with `n` vertices has fewer than `6n` directed edges and `2n` faces. Limiting
+/// the vertex count keeps all element indices representable by the `u32` stored in handles.
+pub const MAX_VERTICES: usize = (u32::MAX / 6) as usize;
+
+/// Returns an error if `additional` more vertices would exceed [MAX_VERTICES].
+pub fn check_vertex_capacity<V, DE, UE, F>(
+    dcel: &Dcel<V, DE, UE, F>,
+    additional: usize,
+) -> Result<(), InsertionError> {
+    match dcel.num_vertices().checked_add(additional) {
+        Some(total) if total <= MAX_VERTICES => Ok(()),
+        _ => Err(InsertionError::TooManyVertices),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IsolateVertexResult {
@@ -69,7 +86,7 @@ pub fn isolate_vertex_and_fill_hole<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     border_loop: Vec<FixedDirectedEdgeHandle>,
     vertex_to_remove: FixedVertexHandle,
-) -> IsolateVertexResult
+) -> Result<IsolateVertexResult, InternalError>
 where
     DE: Default,
     UE: Default,
@@ -93,20 +110,29 @@ pub fn remesh_edge_ring<V, DE, UE, F>(
     mut border_loop: Vec<FixedDirectedEdgeHandle>,
     edges_to_remove: Vec<FixedUndirectedEdgeHandle>,
     faces_to_remove: Vec<FixedFaceHandle<InnerTag>>,
-) -> IsolateVertexResult
+) -> Result<IsolateVertexResult, InternalError>
 where
     DE: Default,
     UE: Default,
     F: Default,
 {
+    // Check before mutating anything: a border loop always encloses at least one triangle.
+    let (Some(mut inner_edge), [inner_edge_prev, inner_edge_next, ..]) =
+        (border_loop.pop(), border_loop.as_slice())
+    else {
+        return Err(internal_error!(
+            "Border loop must contain at least three edges. This is a bug."
+        ));
+    };
+    let (inner_edge_prev, inner_edge_next) = (*inner_edge_prev, *inner_edge_next);
+
     let mut new_edges = Vec::new();
     let smallest_new_edge = FixedUndirectedEdgeHandle::new(dcel.edges.len());
 
     // Re-mesh border loop by fanning out triangles
-    let mut inner_edge = border_loop.pop().unwrap();
     let fan_origin = dcel.directed_edge(inner_edge).from().fix();
-    while border_loop.len() > 2 {
-        let outer_edge = border_loop.pop().unwrap();
+    while let [_, _, .., outer_edge] = *border_loop.as_slice() {
+        border_loop.pop();
         let outer_edge_from = dcel.directed_edge(outer_edge).from().fix();
         let outer_edge_to = dcel.directed_edge(outer_edge).to().fix();
 
@@ -169,9 +195,7 @@ where
         inner_edge = new_edge_handle.rev();
     }
 
-    // Fix last triangle
-    let inner_edge_next = border_loop.pop().unwrap();
-    let inner_edge_prev = border_loop.pop().unwrap();
+    // Fix last triangle. The loop above stops with exactly the two edges checked at the start.
 
     // Create a new face for the last triangle
     let new_face_handle = FixedFaceHandle::new(dcel.faces.len());
@@ -204,12 +228,12 @@ where
     // fan_origin is the third vertex of the triangle
     dcel.vertices[fan_origin.index()].out_edge = Some(inner_edge);
 
-    IsolateVertexResult {
+    Ok(IsolateVertexResult {
         new_edges,
         smallest_new_edge,
         edges_to_remove,
         faces_to_remove,
-    }
+    })
 }
 
 pub fn create_single_face_between_edge_and_next<V, DE, UE, F>(
@@ -394,7 +418,7 @@ pub fn extend_line<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     end_vertex: FixedVertexHandle,
     new_vertex_handle: FixedVertexHandle,
-) -> FixedVertexHandle
+) -> Result<FixedVertexHandle, InternalError>
 where
     DE: Default,
     UE: Default,
@@ -407,14 +431,18 @@ where
     // <--out_edge-- end_vertex <---new_edge--- new_vertex
 
     let end_vertex = dcel.vertex(end_vertex);
-    let out_edge = end_vertex.out_edge().expect("end vertex must not isolated");
+    let Some(out_edge) = end_vertex.out_edge() else {
+        return Err(internal_error!(
+            "End vertex of a line must not be isolated. This is a bug."
+        ));
+    };
     let in_edge = out_edge.rev();
 
-    assert_eq!(
-        out_edge,
-        in_edge.rev(),
-        "end vertex is not at the end of the line"
-    );
+    if out_edge.prev() != in_edge {
+        return Err(internal_error!(
+            "End vertex is not at the end of the line. This is a bug."
+        ));
+    }
 
     let new_edge = FixedDirectedEdgeHandle::new_normalized(dcel.num_undirected_edges());
     let new_edge_rev = new_edge.rev();
@@ -445,21 +473,25 @@ where
 
     dcel.vertices[new_vertex_handle.index()].out_edge = Some(new_edge);
 
-    new_vertex_handle
+    Ok(new_vertex_handle)
 }
 
 pub fn split_edge_when_all_vertices_on_line<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     edge: FixedDirectedEdgeHandle,
     new_vertex_handle: FixedVertexHandle,
-) -> [FixedDirectedEdgeHandle; 2]
+) -> Result<[FixedDirectedEdgeHandle; 2], InternalError>
 where
     DE: Default,
     UE: Default,
 {
     let edge = dcel.directed_edge(edge);
     let rev = edge.rev();
-    assert_eq!(edge.face(), rev.face());
+    if edge.face() != rev.face() {
+        return Err(internal_error!(
+            "Edges of a line must be adjacent to the outer face on both sides. This is a bug."
+        ));
+    }
 
     let new_edge = FixedDirectedEdgeHandle::new_normalized(dcel.num_undirected_edges());
     let new_edge_rev = new_edge.rev();
@@ -515,7 +547,7 @@ where
 
     dcel.vertices[new_vertex_handle.index()].out_edge = Some(new_edge);
 
-    [edge, new_edge]
+    Ok([edge, new_edge])
 }
 
 /// Splits `edge_handle` only one side. Used to split edges on the convex hull.
@@ -871,7 +903,7 @@ pub fn insert_into_triangle<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     v: FixedVertexHandle,
     f0: FixedFaceHandle<InnerTag>,
-) -> FixedVertexHandle
+) -> Result<FixedVertexHandle, InternalError>
 where
     DE: Default,
     UE: Default,
@@ -900,10 +932,12 @@ where
     // /#_____________________________#\
     //                f2
 
-    let e0 = dcel.faces[f0.index()].adjacent_edge.expect(
-        "Face without adjacent edge should not exist when at least two vertices are present. \
-        This is a bug.",
-    );
+    let Some(e0) = dcel.faces[f0.index()].adjacent_edge else {
+        return Err(internal_error!(
+            "Face without adjacent edge should not exist when at least two vertices are present. \
+            This is a bug."
+        ));
+    };
 
     let e1 = dcel.half_edge(e0).next;
     let e2 = dcel.half_edge(e1).next;
@@ -992,7 +1026,7 @@ where
     dcel.edges.push(EdgeEntry::new(edge7, edge8));
 
     // Return inserted vertex handle
-    v.adjust_inner_outer()
+    Ok(v.adjust_inner_outer())
 }
 
 pub fn new<V, DE, UE, F>() -> Dcel<V, DE, UE, F>
@@ -1207,9 +1241,12 @@ fn swap_remove_face<V, DE, UE, F>(dcel: &mut Dcel<V, DE, UE, F>, face: FixedFace
 pub fn remove_when_degenerate<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     vertex_to_remove: FixedVertexHandle,
-) -> RemovalResult<V> {
+) -> Result<RemovalResult<V>, InternalError> {
+    // Callers validate `vertex_to_remove`, so the triangulation cannot be empty.
     match dcel.num_vertices() {
-        0 => panic!("Cannot remove vertex when triangulation is empty"),
+        0 => Err(internal_error!(
+            "Cannot remove vertex when triangulation is empty. This is a bug."
+        )),
         1 => remove_when_one_vertex_left(dcel, vertex_to_remove),
         2 => remove_when_two_vertices_left(dcel, vertex_to_remove),
         _ => remove_when_all_vertices_on_line(dcel, vertex_to_remove),
@@ -1219,26 +1256,32 @@ pub fn remove_when_degenerate<V, DE, UE, F>(
 fn remove_when_one_vertex_left<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     vertex_to_remove: FixedVertexHandle,
-) -> RemovalResult<V> {
-    assert_eq!(
-        vertex_to_remove.index(),
-        0,
-        "Attempting to remove invalid vertex"
-    );
+) -> Result<RemovalResult<V>, InternalError> {
+    let (0, Some(removed_vertex)) = (vertex_to_remove.index(), dcel.vertices.pop()) else {
+        return Err(internal_error!(
+            "Attempting to remove invalid vertex. This is a bug."
+        ));
+    };
 
-    RemovalResult {
-        removed_vertex: dcel.vertices.pop().unwrap().data,
+    Ok(RemovalResult {
+        removed_vertex: removed_vertex.data,
         swapped_in_vertex: None,
-    }
+    })
 }
 
 fn remove_when_two_vertices_left<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     vertex_to_remove: FixedVertexHandle,
-) -> RemovalResult<V> {
-    assert_eq!(dcel.num_faces(), 1);
-    assert_eq!(dcel.num_vertices(), 2);
-    assert_eq!(dcel.num_directed_edges(), 2);
+) -> Result<RemovalResult<V>, InternalError> {
+    if dcel.num_faces() != 1
+        || dcel.num_vertices() != 2
+        || dcel.num_directed_edges() != 2
+        || vertex_to_remove.index() >= 2
+    {
+        return Err(internal_error!(
+            "Unexpected topology of a triangulation with two vertices. This is a bug."
+        ));
+    }
 
     let swapped_in_vertex = if vertex_to_remove.index() == 1 {
         None
@@ -1250,16 +1293,16 @@ fn remove_when_two_vertices_left<V, DE, UE, F>(
     dcel.faces[OUTER_FACE_HANDLE.index()].adjacent_edge = None;
     dcel.vertices[0].out_edge = None;
     dcel.edges.clear();
-    RemovalResult {
+    Ok(RemovalResult {
         removed_vertex: result,
         swapped_in_vertex,
-    }
+    })
 }
 
 fn remove_when_all_vertices_on_line<V, DE, UE, F>(
     dcel: &mut Dcel<V, DE, UE, F>,
     vertex_to_remove: FixedVertexHandle,
-) -> RemovalResult<V> {
+) -> Result<RemovalResult<V>, InternalError> {
     let out_edges: Vec<_> = dcel.vertex(vertex_to_remove).out_edges().collect();
     match &*out_edges {
         [out_edge1] => {
@@ -1279,7 +1322,7 @@ fn remove_when_all_vertices_on_line<V, DE, UE, F>(
 
             swap_remove_undirected_edge(dcel, out_edge1.as_undirected());
 
-            swap_remove_vertex(dcel, vertex_to_remove)
+            Ok(swap_remove_vertex(dcel, vertex_to_remove))
         }
         [e1, e2] => {
             // Topology sketch (with v0 = vertex_to_remove, t1 = e1.rev()):
@@ -1311,9 +1354,11 @@ fn remove_when_all_vertices_on_line<V, DE, UE, F>(
 
             let result = swap_remove_vertex(dcel, vertex_to_remove);
             swap_remove_undirected_edge(dcel, e2.as_undirected());
-            result
+            Ok(result)
         }
-        _ => panic!("Vertex with invalid out edges found. This is a bug."),
+        _ => Err(internal_error!(
+            "Vertex with invalid out edges found. This is a bug."
+        )),
     }
 }
 
@@ -1435,7 +1480,7 @@ mod test {
     fn test_insert_into_triangle() {
         let mut dcel = default_triangle();
         let new_vertex = super::append_unconnected_vertex(&mut dcel, 3);
-        super::insert_into_triangle(&mut dcel, new_vertex, FixedFaceHandle::new(1));
+        super::insert_into_triangle(&mut dcel, new_vertex, FixedFaceHandle::new(1)).unwrap();
         assert_eq!(dcel.faces.len(), 4);
         assert_eq!(dcel.num_directed_edges(), 12);
         assert_eq!(dcel.vertices.len(), 4);
@@ -1455,13 +1500,14 @@ mod test {
 
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
         let new_vertex =
-            super::insert_into_triangle(&mut dcel, v3, face_to_insert.adjust_inner_outer());
+            super::insert_into_triangle(&mut dcel, v3, face_to_insert.adjust_inner_outer())
+                .unwrap();
 
         let vertex_to_remove = FixedVertexHandle::new(3);
         let border_loop = get_border_loop(dcel.vertex(new_vertex));
 
         let mut data =
-            super::isolate_vertex_and_fill_hole(&mut dcel, border_loop, vertex_to_remove);
+            super::isolate_vertex_and_fill_hole(&mut dcel, border_loop, vertex_to_remove).unwrap();
         super::cleanup_isolated_vertex(&mut dcel, &mut data);
         super::swap_remove_vertex(&mut dcel, vertex_to_remove);
         assert_eq!(dcel.vertices.len(), 3);
@@ -1475,7 +1521,7 @@ mod test {
         let mut dcel = default_triangle();
 
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
-        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1));
+        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1)).unwrap();
 
         let e_split = dcel
             .get_edge_from_neighbors(FixedVertexHandle::new(0), FixedVertexHandle::new(3))
@@ -1487,7 +1533,7 @@ mod test {
         let border_loop = get_border_loop(dcel.vertex(vertex_to_remove));
 
         let mut result =
-            super::isolate_vertex_and_fill_hole(&mut dcel, border_loop, vertex_to_remove);
+            super::isolate_vertex_and_fill_hole(&mut dcel, border_loop, vertex_to_remove).unwrap();
         super::cleanup_isolated_vertex(&mut dcel, &mut result);
         super::swap_remove_vertex(&mut dcel, vertex_to_remove);
         assert_eq!(dcel.vertices.len(), 4);
@@ -1500,7 +1546,7 @@ mod test {
     fn test_cw_iterator() {
         let mut dcel = default_triangle();
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
-        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1));
+        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1)).unwrap();
         let vertex = dcel.vertices().next().unwrap();
         assert_eq!(vertex.out_edges().count(), 3);
         assert_eq!(vertex.out_edges().rev().count(), 3);
@@ -1517,7 +1563,7 @@ mod test {
     fn test_swap() {
         let mut dcel = default_triangle();
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
-        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1));
+        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1)).unwrap();
         let v = FixedVertexHandle::new;
         for (i0, i1) in [(0, 1), (0, 2), (1, 2), (3, 2), (3, 0), (0, 0), (1, 1)] {
             dcel.swap_vertices(v(i0), v(i1));
@@ -1529,7 +1575,7 @@ mod test {
     fn test_flip() {
         let mut dcel = default_triangle();
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
-        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1));
+        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1)).unwrap();
 
         let e_flip = dcel
             .get_edge_from_neighbors(FixedVertexHandle::new(0), FixedVertexHandle::new(3))
@@ -1560,7 +1606,7 @@ mod test {
     fn test_split() {
         let mut dcel = default_triangle();
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
-        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1));
+        super::insert_into_triangle(&mut dcel, v3, FixedFaceHandle::new(1)).unwrap();
 
         let e_split = dcel
             .get_edge_from_neighbors(FixedVertexHandle::new(0), FixedVertexHandle::new(3))
@@ -1607,7 +1653,7 @@ mod test {
 
         // Test split isolated edge
         let v2 = super::append_unconnected_vertex(&mut dcel, 2);
-        super::split_edge_when_all_vertices_on_line(&mut dcel, edge, v2);
+        super::split_edge_when_all_vertices_on_line(&mut dcel, edge, v2).unwrap();
 
         dcel.sanity_check();
 
@@ -1618,7 +1664,7 @@ mod test {
 
         let non_isolated_edge = dcel.get_edge_from_neighbors(v0, v2).unwrap().fix();
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
-        super::split_edge_when_all_vertices_on_line(&mut dcel, non_isolated_edge, v3);
+        super::split_edge_when_all_vertices_on_line(&mut dcel, non_isolated_edge, v3).unwrap();
 
         dcel.sanity_check();
         assert_eq!(dcel.num_directed_edges(), 6);
@@ -1635,11 +1681,11 @@ mod test {
         super::setup_initial_two_vertices(&mut dcel, v0, v1);
 
         let v2 = super::append_unconnected_vertex(&mut dcel, 2);
-        super::extend_line(&mut dcel, v0, v2);
+        super::extend_line(&mut dcel, v0, v2).unwrap();
         dcel.sanity_check();
 
         let v3 = super::append_unconnected_vertex(&mut dcel, 3);
-        super::extend_line(&mut dcel, v1, v3);
+        super::extend_line(&mut dcel, v1, v3).unwrap();
         dcel.sanity_check();
 
         assert_eq!(dcel.num_vertices(), 4);
@@ -1654,7 +1700,8 @@ mod test {
         let v1 = super::append_unconnected_vertex(&mut dcel, 1);
         super::setup_initial_two_vertices(&mut dcel, v0, v1);
         let v2 = super::append_unconnected_vertex(&mut dcel, 2);
-        super::split_edge_when_all_vertices_on_line(&mut dcel, FixedDirectedEdgeHandle::new(0), v2);
+        super::split_edge_when_all_vertices_on_line(&mut dcel, FixedDirectedEdgeHandle::new(0), v2)
+            .unwrap();
 
         super::create_single_face_between_edge_and_next(&mut dcel, FixedDirectedEdgeHandle::new(0));
 

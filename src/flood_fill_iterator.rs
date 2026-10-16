@@ -1,4 +1,5 @@
 use alloc::{collections::VecDeque, vec::Vec};
+use core::cmp::Ordering;
 
 #[cfg(not(feature = "std"))]
 use hashbrown::HashSet;
@@ -15,7 +16,7 @@ use crate::{
     handles::{
         DirectedEdgeHandle, FixedDirectedEdgeHandle, FixedVertexHandle, UndirectedEdgeHandle,
     },
-    HasPosition, Point2, SpadeNum, Triangulation,
+    HasPosition, Point2, QueryError, SpadeNum, Triangulation,
 };
 
 pub trait DistanceMetric<S>
@@ -49,10 +50,16 @@ pub struct CircleMetric<S: SpadeNum> {
 }
 
 impl<S: SpadeNum> CircleMetric<S> {
-    pub(crate) fn new(center: Point2<S>, radius_2: S) -> Self {
-        assert!(radius_2 >= zero());
+    pub(crate) fn new(center: Point2<S>, radius_2: S) -> Result<Self, QueryError> {
+        // `partial_cmp` returns `None` for NaN, which is rejected as well.
+        if !matches!(
+            radius_2.partial_cmp(&zero()),
+            Some(Ordering::Greater | Ordering::Equal)
+        ) {
+            return Err(QueryError::InvalidRadius);
+        }
 
-        Self { center, radius_2 }
+        Ok(Self { center, radius_2 })
     }
 }
 
@@ -313,20 +320,20 @@ where
         t: &'a T,
         metric: M,
         start_point: Point2<<T::Vertex as HasPosition>::Scalar>,
-    ) -> Self {
-        let start_edges = Self::get_start_edges(t, &metric, start_point);
+    ) -> Result<Self, QueryError> {
+        let start_edges = Self::get_start_edges(t, &metric, start_point)?;
         let already_visited = start_edges
             .iter()
             .map(|edge| t.directed_edge(*edge).from().fix())
             .collect();
 
-        Self {
+        Ok(Self {
             t,
             edge_loop: start_edges.into(),
             pending: None,
             already_visited,
             metric,
-        }
+        })
     }
 
     #[allow(clippy::type_complexity)]
@@ -334,22 +341,22 @@ where
         t: &'a T,
         metric: &M,
         start_point: Point2<<T::Vertex as HasPosition>::Scalar>,
-    ) -> Vec<FixedDirectedEdgeHandle> {
+    ) -> Result<Vec<FixedDirectedEdgeHandle>, QueryError> {
         use crate::PositionInTriangulation::*;
         if !metric.is_point_inside(start_point) {
             // Used to indicate an empty metric, e.g. a rectangle metric with upper < lower
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if t.all_vertices_on_line() {
-            return t
+            return Ok(t
                 .undirected_edges()
                 .filter(|edge| metric.is_handle_inside(*edge))
                 .flat_map(|edge| [edge.as_directed().fix(), edge.as_directed().rev().fix()])
-                .collect();
+                .collect());
         }
 
-        let start_face = match t.locate(start_point) {
+        let start_face = match t.locate(start_point)? {
             OnVertex(point) => t
                 .vertex(point)
                 .out_edges()
@@ -405,11 +412,11 @@ where
             NoTriangulation => None,
         };
 
-        start_face
+        Ok(start_face
             .into_iter()
             .flat_map(|face| face.adjacent_edges().into_iter().rev())
             .map(|edge| edge.fix().rev())
-            .collect()
+            .collect())
     }
 }
 
@@ -574,7 +581,9 @@ mod test {
     #[test]
     fn test_empty() {
         let d = DelaunayTriangulation::<Point2<_>>::default();
-        let edges = d.get_edges_in_rectangle(Point2::new(-1.0, -2.0), Point2::new(2.0, 2.0));
+        let edges = d
+            .get_edges_in_rectangle(Point2::new(-1.0, -2.0), Point2::new(2.0, 2.0))
+            .unwrap();
         assert_eq!(edges.count(), 0);
     }
 
@@ -620,7 +629,9 @@ mod test {
             Point2::new(1.0, -4.0),
         ];
         let d = DelaunayTriangulation::<_>::bulk_load(vertices)?;
-        let edges = d.get_edges_in_rectangle(Point2::new(-10.0, -10.0), Point2::new(10.0, 10.0));
+        let edges = d
+            .get_edges_in_rectangle(Point2::new(-10.0, -10.0), Point2::new(10.0, 10.0))
+            .unwrap();
         assert_eq!(edges.count(), d.num_undirected_edges());
 
         Ok(())
@@ -638,8 +649,8 @@ mod test {
             for points in constraints.as_slice().chunks_exact(2) {
                 let from = c.insert(points[0])?;
                 let to = c.insert(points[1])?;
-                if c.can_add_constraint(from, to) {
-                    c.add_constraint(from, to);
+                if c.can_add_constraint(from, to).unwrap() {
+                    c.add_constraint(from, to).unwrap();
                 }
             }
             test_rectangle_iterator(&c);
@@ -669,7 +680,7 @@ mod test {
             let rectangle_metric = RectangleMetric::new(lower, upper);
 
             // Test edge iteration
-            let edges = d.get_edges_in_rectangle(lower, upper);
+            let edges = d.get_edges_in_rectangle(lower, upper).unwrap();
             let expected_count = d
                 .undirected_edges()
                 .filter(|edge| rectangle_metric.is_handle_inside(*edge))
@@ -680,9 +691,9 @@ mod test {
             let center = lower.add(upper).mul(0.5);
             let radius = (upper.x - lower.x).max(upper.y - lower.y);
             let radius_2 = radius * radius;
-            let circle_metric = CircleMetric::new(center, radius_2);
+            let circle_metric = CircleMetric::new(center, radius_2).unwrap();
 
-            let edges = d.get_edges_in_circle(center, radius_2);
+            let edges = d.get_edges_in_circle(center, radius_2).unwrap();
             let expected_count = d
                 .undirected_edges()
                 .filter(|edge| circle_metric.is_handle_inside(*edge))
@@ -691,14 +702,14 @@ mod test {
             assert_eq!(edges.count(), expected_count);
 
             // Check vertex iteration
-            let vertices = d.get_vertices_in_rectangle(lower, upper);
+            let vertices = d.get_vertices_in_rectangle(lower, upper).unwrap();
             let expected = d
                 .vertices()
                 .filter(|vertex| rectangle_metric.is_point_inside(vertex.position()))
                 .count();
             assert_eq!(vertices.count(), expected);
 
-            let vertices = d.get_vertices_in_circle(center, radius_2);
+            let vertices = d.get_vertices_in_circle(center, radius_2).unwrap();
             let expected = d
                 .vertices()
                 .filter(|vertex| vertex.position().distance_2(center) <= radius_2)

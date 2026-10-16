@@ -9,9 +9,28 @@ use crate::delaunay_core::dcel_operations::append_unconnected_vertex;
 use crate::delaunay_core::Dcel;
 use crate::HintGenerator;
 use crate::Point2;
-use crate::{HasPosition, InsertionError, PositionInTriangulation, Triangulation};
+use crate::{
+    HasPosition, InsertionError, InternalError, PositionInTriangulation, QueryError, SpadeNum,
+    Triangulation,
+};
 
 use alloc::vec::Vec;
+use core::cmp::Ordering;
+
+/// Lexicographically compares two positions, like `Point2::partial_cmp`, but never fails.
+///
+/// Vertex positions are validated on insertion. Using a total order nevertheless ensures that
+/// sorting can never panic, even if a position was changed to NaN after insertion.
+fn total_position_cmp<S: SpadeNum>(left: Point2<S>, right: Point2<S>) -> Ordering {
+    // Adding 0.0 turns -0.0 into 0.0. These compare equal for `partial_cmp`, but not for `total_cmp`.
+    let [left, right] = [left, right].map(|p| {
+        let p = p.to_f64();
+        [p.x + 0.0, p.y + 0.0]
+    });
+    left[0]
+        .total_cmp(&right[0])
+        .then(left[1].total_cmp(&right[1]))
+}
 
 impl<T> TriangulationExt for T where T: Triangulation {}
 
@@ -30,10 +49,12 @@ pub enum VertexToInsert<V> {
 }
 
 impl<V> VertexToInsert<V> {
-    pub fn into_vertex(self) -> V {
+    pub fn into_vertex(self) -> Result<V, InternalError> {
         match self {
-            VertexToInsert::NewVertex(v) => v,
-            VertexToInsert::ExistingVertex(_) => panic!("Cannot convert existing vertex to vertex"),
+            VertexToInsert::NewVertex(v) => Ok(v),
+            VertexToInsert::ExistingVertex(_) => Err(internal_error!(
+                "Cannot convert existing vertex to vertex. This is a bug."
+            )),
         }
     }
 
@@ -62,24 +83,24 @@ impl PositionWhenAllVerticesOnLine {
     fn to_regular_position_in_triangulation<T: Triangulation>(
         self,
         triangulation: &T,
-    ) -> PositionInTriangulation
+    ) -> Result<PositionInTriangulation, InternalError>
     where
         T::Vertex: HasPosition,
     {
         use PositionWhenAllVerticesOnLine::*;
-        match self {
+        Ok(match self {
             OnEdge(edge) => PositionInTriangulation::OnEdge(edge),
             OnVertex(v) => PositionInTriangulation::OnVertex(v),
             NotOnLine(edge) => PositionInTriangulation::OutsideOfConvexHull(edge),
             ExtendingLine(v) => {
-                let out_edge = triangulation
-                    .vertex(v)
-                    .out_edge()
-                    .expect("Could not find an out edge. This is a bug in spade.")
-                    .fix();
-                PositionInTriangulation::OutsideOfConvexHull(out_edge)
+                let Some(out_edge) = triangulation.vertex(v).out_edge() else {
+                    return Err(internal_error!(
+                        "Could not find an out edge. This is a bug in spade."
+                    ));
+                };
+                PositionInTriangulation::OutsideOfConvexHull(out_edge.fix())
             }
-        }
+        })
     }
 }
 
@@ -101,7 +122,7 @@ pub trait TriangulationExt: Triangulation {
     ) -> Result<FixedVertexHandle, InsertionError> {
         math::validate_vertex(&t)?;
         let position = t.position();
-        let result = self.insert_with_hint_option_impl(VertexToInsert::NewVertex(t), hint);
+        let result = self.insert_with_hint_option_impl(VertexToInsert::NewVertex(t), hint)?;
 
         self.hint_generator_mut()
             .notify_vertex_inserted(result, position);
@@ -112,30 +133,39 @@ pub trait TriangulationExt: Triangulation {
         &mut self,
         t: VertexToInsert<Self::Vertex>,
         hint: Option<FixedVertexHandle>,
-    ) -> FixedVertexHandle {
+    ) -> Result<FixedVertexHandle, InsertionError> {
         use PositionInTriangulation::*;
 
+        if let VertexToInsert::NewVertex(_) = t {
+            dcel_operations::check_vertex_capacity(self.s(), 1)?;
+        }
+
         let insertion_result = match self.num_vertices() {
-            0 => return dcel_operations::append_unconnected_vertex(self.s_mut(), t.into_vertex()),
-            1 => self.insert_second_vertex(t.into_vertex()),
+            0 => {
+                return Ok(dcel_operations::append_unconnected_vertex(
+                    self.s_mut(),
+                    t.into_vertex()?,
+                ))
+            }
+            1 => self.insert_second_vertex(t.into_vertex()?)?,
             _ => {
                 let pos = t.position(self.s());
 
                 if self.all_vertices_on_line() {
-                    let location = self.locate_when_all_vertices_on_line(pos);
-                    self.insert_when_all_vertices_on_line(location, t)
+                    let location = self.locate_when_all_vertices_on_line(pos)?;
+                    self.insert_when_all_vertices_on_line(location, t)?
                 } else {
-                    let position_in_triangulation = self.locate_with_hint_option_core(pos, hint);
+                    let position_in_triangulation = self.locate_with_hint_option_core(pos, hint)?;
                     match position_in_triangulation {
                         OutsideOfConvexHull(edge) => {
                             let resolved = t.resolve(self.s_mut());
                             InsertionResult::NewlyInserted(
-                                self.insert_outside_of_convex_hull(edge, resolved),
+                                self.insert_outside_of_convex_hull(edge, resolved)?,
                             )
                         }
                         OnFace(face) => {
                             let resolved = t.resolve(self.s_mut());
-                            InsertionResult::NewlyInserted(self.insert_into_face(face, resolved))
+                            InsertionResult::NewlyInserted(self.insert_into_face(face, resolved)?)
                         }
                         OnEdge(edge) => {
                             let new_handle = t.resolve(self.s_mut());
@@ -151,85 +181,105 @@ pub trait TriangulationExt: Triangulation {
                             InsertionResult::NewlyInserted(new_handle)
                         }
                         OnVertex(vertex) => {
-                            self.s_mut().update_vertex(vertex, t.into_vertex());
+                            self.s_mut().update_vertex(vertex, t.into_vertex()?);
                             InsertionResult::Updated(vertex)
                         }
-                        NoTriangulation => panic!("Error during vertex lookup. This is a bug."),
+                        NoTriangulation => {
+                            return Err(internal_error!(
+                                "Error during vertex lookup. This is a bug."
+                            )
+                            .into())
+                        }
                     }
                 }
             }
         };
 
-        match insertion_result {
+        Ok(match insertion_result {
             InsertionResult::NewlyInserted(new_handle) => new_handle,
             InsertionResult::Updated(update_handle) => update_handle,
-        }
+        })
     }
 
     fn locate_when_all_vertices_on_line(
         &self,
         position: Point2<<Self::Vertex as HasPosition>::Scalar>,
-    ) -> PositionWhenAllVerticesOnLine {
+    ) -> Result<PositionWhenAllVerticesOnLine, InternalError> {
         use PositionWhenAllVerticesOnLine::*;
 
-        let edge = self
-            .directed_edges()
-            .next()
-            .expect("Must not be called on empty triangulations");
+        let Some(edge) = self.directed_edges().next() else {
+            return Err(internal_error!(
+                "Must not be called on empty triangulations. This is a bug."
+            ));
+        };
         let query = edge.side_query(position);
         if query.is_on_left_side() {
-            return NotOnLine(edge.fix());
+            return Ok(NotOnLine(edge.fix()));
         }
         if query.is_on_right_side() {
-            return NotOnLine(edge.fix().rev());
+            return Ok(NotOnLine(edge.fix().rev()));
         }
 
         let mut vertices: Vec<_> = self.vertices().filter(|v| v.out_edge().is_some()).collect();
-        vertices.sort_by(|left, right| left.position().partial_cmp(&right.position()).unwrap());
+        vertices.sort_by(|left, right| total_position_cmp(left.position(), right.position()));
 
         let index_to_insert =
-            match vertices.binary_search_by(|v| v.position().partial_cmp(&position).unwrap()) {
-                Ok(index) => return OnVertex(vertices[index].fix()),
+            match vertices.binary_search_by(|v| total_position_cmp(v.position(), position)) {
+                Ok(index) => return Ok(OnVertex(vertices[index].fix())),
                 Err(index) => index,
             };
 
+        let (Some(first), Some(last)) = (vertices.first(), vertices.last()) else {
+            return Err(internal_error!(
+                "Line must contain connected vertices. This is a bug."
+            ));
+        };
         if index_to_insert == 0 {
-            return ExtendingLine(vertices.first().unwrap().fix());
+            return Ok(ExtendingLine(first.fix()));
         }
         if index_to_insert == vertices.len() {
-            return ExtendingLine(vertices.last().unwrap().fix());
+            return Ok(ExtendingLine(last.fix()));
         }
 
         let v1 = vertices[index_to_insert];
         let v2 = vertices[index_to_insert - 1];
 
-        let edge = self
-            .get_edge_from_neighbors(v1.fix(), v2.fix())
-            .expect("Expected edge between sorted neighbors. This is a bug in spade.");
-        OnEdge(edge.fix())
+        let Some(edge) = self.get_edge_from_neighbors(v1.fix(), v2.fix()) else {
+            return Err(internal_error!(
+                "Expected edge between sorted neighbors. This is a bug in spade."
+            ));
+        };
+        Ok(OnEdge(edge.fix()))
     }
 
-    fn insert_second_vertex(&mut self, vertex: Self::Vertex) -> InsertionResult {
-        assert_eq!(self.num_vertices(), 1);
+    fn insert_second_vertex(
+        &mut self,
+        vertex: Self::Vertex,
+    ) -> Result<InsertionResult, InternalError> {
+        if self.num_vertices() != 1 {
+            return Err(internal_error!(
+                "Expected exactly one vertex before inserting the second. This is a bug."
+            ));
+        }
 
         let first_vertex = FixedVertexHandle::new(0);
         if self.vertex(first_vertex).position() == vertex.position() {
             self.s_mut().update_vertex(first_vertex, vertex);
-            return InsertionResult::Updated(first_vertex);
+            return Ok(InsertionResult::Updated(first_vertex));
         }
 
         let second_vertex = dcel_operations::append_unconnected_vertex(self.s_mut(), vertex);
         dcel_operations::setup_initial_two_vertices(self.s_mut(), first_vertex, second_vertex);
 
-        InsertionResult::NewlyInserted(second_vertex)
+        Ok(InsertionResult::NewlyInserted(second_vertex))
     }
 
     fn insert_when_all_vertices_on_line(
         &mut self,
         location: PositionWhenAllVerticesOnLine,
         new_vertex: VertexToInsert<Self::Vertex>,
-    ) -> InsertionResult {
-        match location {
+    ) -> Result<InsertionResult, InternalError> {
+        Ok(match location {
             PositionWhenAllVerticesOnLine::OnEdge(edge) => {
                 let new_vertex = new_vertex.resolve(self.s_mut());
                 let is_constraint_edge = self.is_defined_legal(edge.as_undirected());
@@ -237,7 +287,7 @@ pub trait TriangulationExt: Triangulation {
                     self.s_mut(),
                     edge,
                     new_vertex,
-                );
+                )?;
 
                 if is_constraint_edge {
                     self.handle_legal_edge_split(new_edges);
@@ -247,22 +297,22 @@ pub trait TriangulationExt: Triangulation {
             PositionWhenAllVerticesOnLine::OnVertex(vertex) => InsertionResult::Updated(vertex),
             PositionWhenAllVerticesOnLine::NotOnLine(edge) => {
                 let new_vertex = new_vertex.resolve(self.s_mut());
-                let result = self.insert_outside_of_convex_hull(edge, new_vertex);
+                let result = self.insert_outside_of_convex_hull(edge, new_vertex)?;
                 InsertionResult::NewlyInserted(result)
             }
             PositionWhenAllVerticesOnLine::ExtendingLine(end_vertex) => {
                 let new_vertex = new_vertex.resolve(self.s_mut());
-                let result = dcel_operations::extend_line(self.s_mut(), end_vertex, new_vertex);
+                let result = dcel_operations::extend_line(self.s_mut(), end_vertex, new_vertex)?;
                 InsertionResult::NewlyInserted(result)
             }
-        }
+        })
     }
 
     fn locate_with_hint_option_core(
         &self,
         point: Point2<<Self::Vertex as HasPosition>::Scalar>,
         hint: Option<FixedVertexHandle>,
-    ) -> PositionInTriangulation {
+    ) -> Result<PositionInTriangulation, QueryError> {
         let start = hint.unwrap_or_else(|| self.hint_generator().get_hint(point));
         self.locate_with_hint_fixed_core(point, start)
     }
@@ -271,13 +321,18 @@ pub trait TriangulationExt: Triangulation {
         &mut self,
         convex_hull_edge: FixedDirectedEdgeHandle,
         new_vertex: FixedVertexHandle,
-    ) -> FixedVertexHandle {
+    ) -> Result<FixedVertexHandle, InternalError> {
         let position = self.vertex(new_vertex).position();
 
-        assert!(self
+        if !self
             .directed_edge(convex_hull_edge)
             .side_query(position)
-            .is_on_left_side());
+            .is_on_left_side()
+        {
+            return Err(internal_error!(
+                "New vertex must lie on the left side of the convex hull edge. This is a bug."
+            ));
+        }
 
         let result = dcel_operations::create_new_face_adjacent_to_edge(
             self.s_mut(),
@@ -324,17 +379,17 @@ pub trait TriangulationExt: Triangulation {
             }
         }
 
-        result
+        Ok(result)
     }
 
     fn insert_into_face(
         &mut self,
         face: FixedFaceHandle<InnerTag>,
         t: FixedVertexHandle,
-    ) -> FixedVertexHandle {
-        let new_handle = dcel_operations::insert_into_triangle(self.s_mut(), t, face);
+    ) -> Result<FixedVertexHandle, InternalError> {
+        let new_handle = dcel_operations::insert_into_triangle(self.s_mut(), t, face)?;
         self.legalize_vertex(new_handle);
-        new_handle
+        Ok(new_handle)
     }
 
     fn insert_on_edge(
@@ -492,24 +547,25 @@ pub trait TriangulationExt: Triangulation {
         &self,
         target_position: Point2<<Self::Vertex as HasPosition>::Scalar>,
         start: FixedVertexHandle,
-    ) -> PositionInTriangulation {
+    ) -> Result<PositionInTriangulation, QueryError> {
         let pos = target_position.to_f64();
-        assert!(!f64::is_nan(pos.x));
-        assert!(!f64::is_nan(pos.y));
+        if pos.x.is_nan() || pos.y.is_nan() {
+            return Err(QueryError::NAN);
+        }
 
         if self.num_vertices() < 2 {
-            return match self.vertices().next() {
+            return Ok(match self.vertices().next() {
                 Some(single_vertex) if single_vertex.position() == target_position => {
                     PositionInTriangulation::OnVertex(single_vertex.fix())
                 }
                 _ => PositionInTriangulation::NoTriangulation,
-            };
+            });
         }
 
         if self.all_vertices_on_line() {
-            return self
-                .locate_when_all_vertices_on_line(target_position)
-                .to_regular_position_in_triangulation(self);
+            return Ok(self
+                .locate_when_all_vertices_on_line(target_position)?
+                .to_regular_position_in_triangulation(self)?);
         }
 
         let start = self.validate_vertex_handle(start);
@@ -545,9 +601,9 @@ pub trait TriangulationExt: Triangulation {
 
         // e0 implicitly defines the rotation vertex V: It is always e0.from(). The segment is
         // adjacent to this edge iff `rotate_ccw == true` (see below)
-        let mut e0 = closest_vertex
-            .out_edge()
-            .expect("No out edge found. This is a bug.");
+        let Some(mut e0) = closest_vertex.out_edge() else {
+            return Err(internal_error!("No out edge found. This is a bug.").into());
+        };
 
         let mut e0_query = e0.side_query(target_position);
 
@@ -559,18 +615,20 @@ pub trait TriangulationExt: Triangulation {
         loop {
             // Prevent accidental infinite loops (easier to debug). Should never happen
             if loop_counter == 0 {
-                panic!("Failed to locate position. This is a bug in spade.")
+                return Err(
+                    internal_error!("Failed to locate position. This is a bug in spade.").into(),
+                );
             }
             loop_counter -= 1;
 
             let [from, to] = e0.vertices();
             if from.position() == target_position {
                 self.hint_generator().notify_vertex_lookup(from.fix());
-                return PositionInTriangulation::OnVertex(from.fix());
+                return Ok(PositionInTriangulation::OnVertex(from.fix()));
             }
             if to.position() == target_position {
                 self.hint_generator().notify_vertex_lookup(to.fix());
-                return PositionInTriangulation::OnVertex(to.fix());
+                return Ok(PositionInTriangulation::OnVertex(to.fix()));
             }
 
             if e0_query.is_on_line() {
@@ -599,7 +657,7 @@ pub trait TriangulationExt: Triangulation {
 
             let Some(face) = e1.face().as_inner() else {
                 self.hint_generator().notify_vertex_lookup(e1.from().fix());
-                return PositionInTriangulation::OutsideOfConvexHull(e1.fix());
+                return Ok(PositionInTriangulation::OutsideOfConvexHull(e1.fix()));
             };
 
             // rotate around `V = current_edge.from()` (see diagram above)
@@ -620,11 +678,11 @@ pub trait TriangulationExt: Triangulation {
             let e2_query = e2.side_query(target_position);
             if e2_query.is_on_line() {
                 self.hint_generator().notify_vertex_lookup(e2.to().fix());
-                return PositionInTriangulation::OnEdge(e2.fix());
+                return Ok(PositionInTriangulation::OnEdge(e2.fix()));
             }
             if e2_query.is_on_left_side() {
                 self.hint_generator().notify_vertex_lookup(e2.to().fix());
-                return PositionInTriangulation::OnFace(face.fix());
+                return Ok(PositionInTriangulation::OnFace(face.fix()));
             }
 
             // Check if an opposite vertex ("O" in the diagram above) exists. Otherwise, just
@@ -642,9 +700,12 @@ pub trait TriangulationExt: Triangulation {
         }
     }
 
-    fn remove_and_notify(&mut self, vertex_to_remove: FixedVertexHandle) -> Self::Vertex {
+    fn remove_and_notify(
+        &mut self,
+        vertex_to_remove: FixedVertexHandle,
+    ) -> Result<Self::Vertex, InternalError> {
         let position = self.vertex(vertex_to_remove).position();
-        let removal_result = self.remove_core(vertex_to_remove);
+        let removal_result = self.remove_core(vertex_to_remove)?;
 
         let swapped_in_point = removal_result
             .swapped_in_vertex
@@ -656,10 +717,13 @@ pub trait TriangulationExt: Triangulation {
             position,
         );
 
-        removal_result.removed_vertex
+        Ok(removal_result.removed_vertex)
     }
 
-    fn remove_core(&mut self, vertex_to_remove: FixedVertexHandle) -> RemovalResult<Self::Vertex> {
+    fn remove_core(
+        &mut self,
+        vertex_to_remove: FixedVertexHandle,
+    ) -> Result<RemovalResult<Self::Vertex>, InternalError> {
         if self.num_all_faces() <= 1 {
             return dcel_operations::remove_when_degenerate(self.s_mut(), vertex_to_remove);
         }
@@ -677,30 +741,36 @@ pub trait TriangulationExt: Triangulation {
         }
 
         if let Some(convex_hull_edge) = convex_hull_edge {
-            let mut isolation_result = self.isolate_convex_hull_vertex(convex_hull_edge);
+            let mut isolation_result = self.isolate_convex_hull_vertex(convex_hull_edge)?;
 
             dcel_operations::cleanup_isolated_vertex(self.s_mut(), &mut isolation_result);
-            dcel_operations::swap_remove_vertex(self.s_mut(), vertex_to_remove)
+            Ok(dcel_operations::swap_remove_vertex(
+                self.s_mut(),
+                vertex_to_remove,
+            ))
         } else {
             let mut isolation_result = dcel_operations::isolate_vertex_and_fill_hole(
                 self.s_mut(),
                 border_loop,
                 vertex_to_remove,
-            );
+            )?;
             // Not exactly elegant. IsolateVertexResult should maybe be split into two parts
             let mut new_edges = core::mem::take(&mut isolation_result.new_edges);
             self.legalize_edges_after_removal(&mut new_edges, |edge| {
                 !isolation_result.is_new_edge(edge)
-            });
+            })?;
             dcel_operations::cleanup_isolated_vertex(self.s_mut(), &mut isolation_result);
-            dcel_operations::swap_remove_vertex(self.s_mut(), vertex_to_remove)
+            Ok(dcel_operations::swap_remove_vertex(
+                self.s_mut(),
+                vertex_to_remove,
+            ))
         }
     }
 
     fn isolate_convex_hull_vertex(
         &mut self,
         convex_hull_out_edge: FixedDirectedEdgeHandle,
-    ) -> IsolateVertexResult {
+    ) -> Result<IsolateVertexResult, InternalError> {
         let mut edges_to_validate = Vec::with_capacity(10);
         let mut convex_edges: Vec<FixedDirectedEdgeHandle> = Vec::with_capacity(10);
 
@@ -744,8 +814,8 @@ pub trait TriangulationExt: Triangulation {
 
         convex_edges.push(loop_end_next);
         let result = dcel_operations::disconnect_edge_strip(self.s_mut(), convex_edges);
-        self.legalize_edges_after_removal(&mut edges_to_validate, |_| false);
-        result
+        self.legalize_edges_after_removal(&mut edges_to_validate, |_| false)?;
+        Ok(result)
     }
 
     /// After a vertex removal, the created hole is stitched together by connecting
@@ -774,7 +844,8 @@ pub trait TriangulationExt: Triangulation {
         &mut self,
         edges_to_validate: &mut Vec<FixedUndirectedEdgeHandle>,
         edge_must_not_be_flipped_predicate: F,
-    ) where
+    ) -> Result<(), InternalError>
+    where
         F: Fn(FixedUndirectedEdgeHandle) -> bool,
     {
         while let Some(next_edge) = edges_to_validate.pop() {
@@ -808,7 +879,9 @@ pub trait TriangulationExt: Triangulation {
                 (None, Some(right)) => math::is_ordered_ccw(right, from, to),
                 (Some(left), None) => math::is_ordered_ccw(left, to, from),
                 (None, None) => {
-                    panic!("Unexpected geometry. This is a bug in spade.")
+                    return Err(internal_error!(
+                        "Unexpected geometry. This is a bug in spade."
+                    ))
                 }
             };
 
@@ -831,6 +904,7 @@ pub trait TriangulationExt: Triangulation {
                 dcel_operations::flip_cw(self.s_mut(), fixed.as_undirected());
             }
         }
+        Ok(())
     }
 
     #[cfg(any(test, fuzzing))]
@@ -1008,7 +1082,7 @@ mod test {
     #[should_panic]
     fn test_locate_nan_empty() {
         let d = DelaunayTriangulation::<Point2<f64>>::default();
-        d.locate(Point2::new(0.0, f64::NAN));
+        d.locate(Point2::new(0.0, f64::NAN)).unwrap();
     }
 
     #[test]
@@ -1017,7 +1091,7 @@ mod test {
         let points = random_points_with_seed(20, SEED);
         let d = DelaunayTriangulation::<Point2<f64>>::bulk_load(points);
         if let Ok(d) = d {
-            d.locate(Point2::new(0.0, f64::NAN));
+            d.locate(Point2::new(0.0, f64::NAN)).unwrap();
         }
     }
 
@@ -1032,7 +1106,7 @@ mod test {
         assert_eq!(d.inner_faces().count(), d.num_inner_faces());
 
         for _ in 0..SIZE / 2 {
-            d.remove(FixedVertexHandle::new(5));
+            d.remove(FixedVertexHandle::new(5)).unwrap();
         }
 
         assert_eq!(d.all_faces().count(), d.num_all_faces());
@@ -1231,7 +1305,7 @@ mod test {
         ];
         let mut d = DelaunayTriangulation::<_>::bulk_load(points)?;
         let to_remove = d.insert(Point2::new(0.0, 0.5))?;
-        d.remove(to_remove);
+        d.remove(to_remove).unwrap();
         assert_eq!(d.num_vertices(), 3);
         // Reinsert the last point, just to see if a crash occurs
         d.insert(Point2::new(0.0, 0.5))?;
@@ -1253,7 +1327,7 @@ mod test {
         let v4_position = Point2::new(2.5, 2.0);
         let v4 = d.insert(v4_position)?;
 
-        let removed = d.remove(v4);
+        let removed = d.remove(v4).unwrap();
         d.sanity_check();
         assert_eq!(removed, v4_position);
         assert_eq!(d.num_vertices(), 7);
@@ -1269,7 +1343,7 @@ mod test {
         let v4_position = Point2::new(1.5, 1.5);
         let v4 = d.insert(v4_position)?;
 
-        let removed = d.remove(v4);
+        let removed = d.remove(v4).unwrap();
         d.sanity_check();
         assert_eq!(removed, v4_position);
         assert_eq!(d.num_vertices(), 3);
@@ -1288,10 +1362,10 @@ mod test {
         let mut d = DelaunayTriangulation::<_>::bulk_load(points)?;
 
         let to_remove = d.insert(Point2::new(0.5, 0.6))?;
-        d.remove(to_remove);
+        d.remove(to_remove).unwrap();
         assert_eq!(d.num_vertices(), 4);
         let to_remove = d.insert(Point2::new(0.5, 0.6))?;
-        d.remove(to_remove);
+        d.remove(to_remove).unwrap();
         assert_eq!(d.num_vertices(), 4);
         d.insert(Point2::new(0.5, 0.6))?;
         d.sanity_check();
@@ -1319,7 +1393,7 @@ mod test {
         for _ in 0..20 {
             points.shuffle(&mut rng);
             let mut d = DelaunayTriangulation::<_>::bulk_load(points.clone())?;
-            d.locate_and_remove(Point2::new(0.0, 0.0));
+            d.locate_and_remove(Point2::new(0.0, 0.0)).unwrap().unwrap();
             d.sanity_check();
         }
         Ok(())
@@ -1344,9 +1418,9 @@ mod test {
         points.shuffle(&mut rng);
         assert_eq!(d.num_vertices(), 1004);
         for point in points {
-            match d.locate(point) {
+            match d.locate(point).unwrap() {
                 OnVertex(handle) => {
-                    d.remove(handle);
+                    d.remove(handle).unwrap();
                 }
                 _ => panic!("Point lookup failed: {:?}", point),
             }
@@ -1365,9 +1439,9 @@ mod test {
 
         points.sort_by(|p1, p2| p1.length2().partial_cmp(&p2.length2()).unwrap());
         for (index, point) in points[3..].iter().rev().enumerate() {
-            match d.locate(*point) {
+            match d.locate(*point).unwrap() {
                 OnVertex(handle) => {
-                    d.remove(handle);
+                    d.remove(handle).unwrap();
                     if index % 50 == 0 {
                         // Check only every 50 iterations to reduce test runtime
                         d.sanity_check();
@@ -1396,7 +1470,7 @@ mod test {
                 // Remove random point
                 let range = Uniform::new(1, d.num_vertices())?;
                 let handle = range.sample(&mut rng);
-                d.remove(FixedVertexHandle::new(handle));
+                d.remove(FixedVertexHandle::new(handle)).unwrap();
             }
         }
         d.sanity_check();
@@ -1413,7 +1487,7 @@ mod test {
 
         while let Some(to_remove) = d.vertices().next() {
             let to_remove = to_remove.fix();
-            d.remove(to_remove);
+            d.remove(to_remove).unwrap();
             d.sanity_check();
         }
 
@@ -1440,13 +1514,13 @@ mod test {
         let mut d = DelaunayTriangulation::<_>::bulk_load(points)?;
 
         assert_eq!(d.num_all_faces(), 5);
-        d.locate_and_remove(Point2::new(1., 0.));
+        d.locate_and_remove(Point2::new(1., 0.)).unwrap().unwrap();
         d.sanity_check();
         assert!(d.all_vertices_on_line());
 
         while let Some(to_remove) = d.vertices().next() {
             let to_remove = to_remove.fix();
-            d.remove(to_remove);
+            d.remove(to_remove).unwrap();
             d.sanity_check();
         }
 
@@ -1470,9 +1544,9 @@ mod test {
             Point2::new(75.0, 80.0),
         ])?;
 
-        triangulation.remove(FixedVertexHandle::new(5));
+        triangulation.remove(FixedVertexHandle::new(5)).unwrap();
         triangulation.sanity_check();
-        triangulation.remove(FixedVertexHandle::new(5));
+        triangulation.remove(FixedVertexHandle::new(5)).unwrap();
         triangulation.sanity_check();
         Ok(())
     }
@@ -1484,7 +1558,7 @@ mod test {
             Point2::new(1.0, 0.0), // This point will be removed
             Point2::new(2.0, 0.0),
         ])?;
-        triangulation.remove(FixedVertexHandle::new(2));
+        triangulation.remove(FixedVertexHandle::new(2)).unwrap();
         triangulation.sanity_check();
         Ok(())
     }
@@ -1498,9 +1572,9 @@ mod test {
         let mut rng = rand::rngs::StdRng::from_seed(*SEED);
         while triangulation.num_vertices() > 3 {
             if rng.random_bool(0.5) {
-                triangulation.remove(FixedVertexHandle::new(1));
+                triangulation.remove(FixedVertexHandle::new(1)).unwrap();
             } else {
-                triangulation.remove(FixedVertexHandle::new(2));
+                triangulation.remove(FixedVertexHandle::new(2)).unwrap();
             }
 
             triangulation.sanity_check();
@@ -1522,7 +1596,7 @@ mod test {
     fn test_locate_when_empty() {
         let triangulation = DelaunayTriangulation::<Point2<_>>::default();
         assert_eq!(
-            triangulation.locate(Point2::new(0.0, 0.0)),
+            triangulation.locate(Point2::new(0.0, 0.0)).unwrap(),
             PositionInTriangulation::NoTriangulation
         )
     }
@@ -1533,11 +1607,11 @@ mod test {
         let point = Point2::new(0.0, 0.0);
         triangulation.insert(point)?;
         assert_eq!(
-            triangulation.locate(point),
+            triangulation.locate(point).unwrap(),
             PositionInTriangulation::OnVertex(FixedVertexHandle::new(0))
         );
         assert_eq!(
-            triangulation.locate(Point2::new(1.0, 1.0)),
+            triangulation.locate(Point2::new(1.0, 1.0)).unwrap(),
             PositionInTriangulation::NoTriangulation
         );
         Ok(())
@@ -1552,23 +1626,23 @@ mod test {
         let v1 = triangulation.insert(p1)?;
 
         assert_eq!(
-            triangulation.locate(p0),
+            triangulation.locate(p0).unwrap(),
             PositionInTriangulation::OnVertex(v0)
         );
         assert_eq!(
-            triangulation.locate(p1),
+            triangulation.locate(p1).unwrap(),
             PositionInTriangulation::OnVertex(v1)
         );
-        let on_edge = triangulation.locate(Point2::new(0.5, 0.5));
+        let on_edge = triangulation.locate(Point2::new(0.5, 0.5)).unwrap();
         match on_edge {
             PositionInTriangulation::OnEdge(_) => {}
             _ => panic!("Expected OnEdge(_), was {:?}", on_edge),
         }
 
-        let hull0 = triangulation.locate(Point2::new(0.0, 1.0));
-        let hull1 = triangulation.locate(Point2::new(0.0, -1.0));
-        let hull2 = triangulation.locate(Point2::new(-1.0, -1.0));
-        let hull3 = triangulation.locate(Point2::new(2.0, 2.0));
+        let hull0 = triangulation.locate(Point2::new(0.0, 1.0)).unwrap();
+        let hull1 = triangulation.locate(Point2::new(0.0, -1.0)).unwrap();
+        let hull2 = triangulation.locate(Point2::new(-1.0, -1.0)).unwrap();
+        let hull3 = triangulation.locate(Point2::new(2.0, 2.0)).unwrap();
 
         let [e0, e1, _, _] = [hull0, hull1, hull2, hull3].map(|hull| {
             if let PositionInTriangulation::OutsideOfConvexHull(edge) = hull {
@@ -1590,8 +1664,69 @@ mod test {
             Point2::new(1.0, 0.0),
             Point2::new(2.0, 0.0),
         ])?;
-        triangulation.remove(FixedVertexHandle::new(2));
+        triangulation.remove(FixedVertexHandle::new(2)).unwrap();
         triangulation.sanity_check();
         Ok(())
+    }
+
+    #[test]
+    fn test_queries_reject_nan() -> Result<(), InsertionError> {
+        use crate::{FloatTriangulation as _, LineIntersectionIterator, QueryError, RemovalError};
+
+        let mut d =
+            DelaunayTriangulation::<Point2<f64>>::bulk_load(random_points_with_seed(20, SEED))?;
+        let nan = Point2::new(f64::NAN, 0.0);
+
+        assert_eq!(d.locate(nan), Err(QueryError::NAN));
+        assert_eq!(d.locate_vertex(nan).err(), Some(QueryError::NAN));
+        assert!(matches!(
+            LineIntersectionIterator::new(&d, nan, Point2::new(0.0, 0.0)),
+            Err(QueryError::NAN)
+        ));
+        assert_eq!(d.locate_and_remove(nan), Err(RemovalError::NAN));
+        assert_eq!(d.num_vertices(), 20);
+
+        let center = Point2::new(0.0, 0.0);
+        assert!(matches!(
+            d.get_edges_in_circle(center, -1.0),
+            Err(QueryError::InvalidRadius)
+        ));
+        assert!(matches!(
+            d.get_vertices_in_circle(center, f64::NAN),
+            Err(QueryError::InvalidRadius)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_invalid_handle() -> Result<(), InsertionError> {
+        use crate::RemovalError;
+
+        let mut d = DelaunayTriangulation::<Point2<f64>>::new();
+        assert_eq!(
+            d.remove(FixedVertexHandle::new(0)),
+            Err(RemovalError::InvalidHandle)
+        );
+
+        d.insert(Point2::new(0.0, 0.0))?;
+        d.insert(Point2::new(1.0, 0.0))?;
+        d.insert(Point2::new(0.0, 1.0))?;
+        assert_eq!(
+            d.remove(FixedVertexHandle::new(3)),
+            Err(RemovalError::InvalidHandle)
+        );
+        assert_eq!(d.num_vertices(), 3);
+        d.sanity_check();
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_handle_index_too_large() {
+        let index = u32::MAX as usize + 1;
+        let error = FixedVertexHandle::from_index(index).unwrap_err();
+        assert_eq!(error.index(), index);
+        assert!(FixedVertexHandle::try_from(index).is_err());
+        assert_eq!(FixedVertexHandle::from_index(3).unwrap().index(), 3);
     }
 }

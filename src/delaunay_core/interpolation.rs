@@ -3,14 +3,25 @@ use core::cell::RefCell;
 use crate::{
     delaunay_core::math,
     handles::{FixedDirectedEdgeHandle, FixedVertexHandle},
-    DelaunayTriangulation, HasPosition, HintGenerator, Point2, PositionInTriangulation,
-    Triangulation,
+    DelaunayTriangulation, HasPosition, HintGenerator, InternalError, Point2,
+    PositionInTriangulation, QueryError, Triangulation,
 };
 use num_traits::{one, zero, Float};
 
 use alloc::vec::Vec;
 
 use super::VertexHandle;
+
+/// Runs `f` with the buffer stored in `buffer`.
+///
+/// Falls back to a temporary buffer if `buffer` is already borrowed. This happens if a user
+/// supplied closure calls back into the same interpolation instance.
+fn with_buffer<T, R>(buffer: &RefCell<Vec<T>>, f: impl FnOnce(&mut Vec<T>) -> R) -> R {
+    match buffer.try_borrow_mut() {
+        Ok(mut buffer) => f(&mut buffer),
+        Err(_) => f(&mut Vec::new()),
+    }
+}
 
 /// Implements methods for natural neighbor interpolation.
 ///
@@ -78,12 +89,12 @@ use super::VertexHandle;
 ///     // Good: Re-use interpolation object!
 ///     let nn = t.natural_neighbor();
 ///     for p in &query_points {
-///         println!("Value at {:?}: {:?}", p, nn.interpolate(|v| v.data().height, *p));
+///         println!("Value at {:?}: {:?}", p, nn.interpolate(|v| v.data().height, *p)?);
 ///     }
 ///
 ///     // Bad (slower): Don't re-use internal buffers
 ///     for p in &query_points {
-///         println!("Value at {:?}: {:?}", p, t.natural_neighbor().interpolate(|v| v.data().height, *p));
+///         println!("Value at {:?}: {:?}", p, t.natural_neighbor().interpolate(|v| v.data().height, *p)?);
 ///     }
 ///     Ok(())
 /// }
@@ -175,9 +186,9 @@ where
         &self,
         position: Point2<<T::Vertex as HasPosition>::Scalar>,
         result: &mut Vec<(FixedVertexHandle, <T::Vertex as HasPosition>::Scalar)>,
-    ) {
+    ) -> Result<(), QueryError> {
         result.clear();
-        match self.triangulation.locate(position) {
+        match self.triangulation.locate(position)? {
             PositionInTriangulation::OnVertex(vertex) => {
                 result.push((vertex, <T::Vertex as HasPosition>::Scalar::from(1.0)))
             }
@@ -195,6 +206,7 @@ where
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Performs barycentric interpolation on this triangulation at a given position.
@@ -207,23 +219,24 @@ where
         &self,
         i: I,
         position: Point2<<T::Vertex as HasPosition>::Scalar>,
-    ) -> Option<<T::Vertex as HasPosition>::Scalar>
+    ) -> Result<Option<<T::Vertex as HasPosition>::Scalar>, QueryError>
     where
         I: Fn(
             VertexHandle<T::Vertex, T::DirectedEdge, T::UndirectedEdge, T::Face>,
         ) -> <T::Vertex as HasPosition>::Scalar,
     {
-        let nns = &mut *self.weight_buffer.borrow_mut();
-        self.get_weights(position, nns);
-        if nns.is_empty() {
-            return None;
-        }
+        with_buffer(&self.weight_buffer, |nns| {
+            self.get_weights(position, nns)?;
+            if nns.is_empty() {
+                return Ok(None);
+            }
 
-        let mut total_sum = zero();
-        for (vertex, weight) in nns {
-            total_sum = total_sum + i(self.triangulation.vertex(*vertex)) * *weight;
-        }
-        Some(total_sum)
+            let mut total_sum = zero();
+            for (vertex, weight) in nns.iter() {
+                total_sum = total_sum + i(self.triangulation.vertex(*vertex)) * *weight;
+            }
+            Ok(Some(total_sum))
+        })
     }
 }
 
@@ -268,15 +281,13 @@ where
         &self,
         position: Point2<<V as HasPosition>::Scalar>,
         result: &mut Vec<(FixedVertexHandle, <V as HasPosition>::Scalar)>,
-    ) {
-        let nns = &mut *self.natural_neighbor_buffer.borrow_mut();
-        get_natural_neighbor_edges(
-            self.triangulation,
-            &mut self.inspect_edges_buffer.borrow_mut(),
-            position,
-            nns,
-        );
-        self.get_natural_neighbor_weights(position, nns, result);
+    ) -> Result<(), QueryError> {
+        with_buffer(&self.natural_neighbor_buffer, |nns| {
+            with_buffer(&self.inspect_edges_buffer, |inspect_buffer| {
+                get_natural_neighbor_edges(self.triangulation, inspect_buffer, position, nns)
+            })?;
+            Ok(self.get_natural_neighbor_weights(position, nns, result)?)
+        })
     }
 
     /// Interpolates a value at a given position.
@@ -290,21 +301,22 @@ where
         &self,
         i: I,
         position: Point2<<V as HasPosition>::Scalar>,
-    ) -> Option<<V as HasPosition>::Scalar>
+    ) -> Result<Option<<V as HasPosition>::Scalar>, QueryError>
     where
         I: Fn(VertexHandle<V, DE, UE, F>) -> <V as HasPosition>::Scalar,
     {
-        let nns = &mut *self.weight_buffer.borrow_mut();
-        self.get_weights(position, nns);
-        if nns.is_empty() {
-            return None;
-        }
+        with_buffer(&self.weight_buffer, |nns| {
+            self.get_weights(position, nns)?;
+            if nns.is_empty() {
+                return Ok(None);
+            }
 
-        let mut total_sum = zero();
-        for (vertex, weight) in nns {
-            total_sum = total_sum + i(self.triangulation.vertex(*vertex)) * *weight;
-        }
-        Some(total_sum)
+            let mut total_sum = zero();
+            for (vertex, weight) in nns.iter() {
+                total_sum = total_sum + i(self.triangulation.vertex(*vertex)) * *weight;
+            }
+            Ok(Some(total_sum))
+        })
     }
 
     /// Interpolates a value at a given position.
@@ -354,7 +366,7 @@ where
     /// // Interpolate point at coordinates (1.0, 2.0). This example uses a known gradients at each vertex.
     /// // The gradient is the direction of steepest ascent for the function at that point
     /// let query_point = Point2::new(1.0, 2.0);
-    /// let value: f64 = nn.interpolate_gradient(|v| v.data().height, |v| v.data().grad, 1.0, query_point).unwrap();
+    /// let value: f64 = nn.interpolate_gradient(|v| v.data().height, |v| v.data().grad, 1.0, query_point).unwrap().expect("query point lies within the convex hull");
     /// ```
     ///
     /// /// # Example 2
@@ -385,11 +397,11 @@ where
     /// // Interpolate point at coordinates (1.0, 2.0).
     /// let query_point = Point2::new(1.0, 2.0);
     /// // Let's interpolate the value with estimated gradients. The gradient is the direction of steepest ascent for the function at that point
-    /// let value: f64 = nn.interpolate_gradient(|v| v.data().height, |v| nn.estimate_gradient(v, |h| h.data().height), 1.0, query_point).unwrap();
+    /// let value: f64 = nn.interpolate_gradient(|v| v.data().height, |v| nn.estimate_gradient(v, |h| h.data().height), 1.0, query_point).unwrap().expect("query point lies within the convex hull");
     ///
     /// // could also have gone and calculated all grads upfront like this, notice the s in gradients
     /// let grads = nn.estimate_gradients(|v| v.data().height);
-    /// let value: f64 = nn.interpolate_gradient(|v| v.data().height, &grads, 1.0, query_point).unwrap();
+    /// let value: f64 = nn.interpolate_gradient(|v| v.data().height, &grads, 1.0, query_point).unwrap().expect("query point lies within the convex hull");
     /// ```
     ///
     /// # References
@@ -406,13 +418,29 @@ where
         g: G,
         flatness: <V as HasPosition>::Scalar,
         position: Point2<<V as HasPosition>::Scalar>,
+    ) -> Result<Option<<V as HasPosition>::Scalar>, QueryError>
+    where
+        I: Fn(VertexHandle<V, DE, UE, F>) -> <V as HasPosition>::Scalar,
+        G: Fn(VertexHandle<V, DE, UE, F>) -> [<V as HasPosition>::Scalar; 2],
+    {
+        with_buffer(&self.weight_buffer, |nns| {
+            self.get_weights(position, nns)?;
+            Ok(self.interpolate_gradient_with_weights(i, g, flatness, position, nns))
+        })
+    }
+
+    fn interpolate_gradient_with_weights<I, G>(
+        &self,
+        i: I,
+        g: G,
+        flatness: <V as HasPosition>::Scalar,
+        position: Point2<<V as HasPosition>::Scalar>,
+        nns: &[(FixedVertexHandle, <V as HasPosition>::Scalar)],
     ) -> Option<<V as HasPosition>::Scalar>
     where
         I: Fn(VertexHandle<V, DE, UE, F>) -> <V as HasPosition>::Scalar,
         G: Fn(VertexHandle<V, DE, UE, F>) -> [<V as HasPosition>::Scalar; 2],
     {
-        let nns = &mut *self.weight_buffer.borrow_mut();
-        self.get_weights(position, nns);
         if nns.is_empty() {
             return None;
         }
@@ -495,17 +523,17 @@ where
         position: Point2<<V as HasPosition>::Scalar>,
         nns: &[FixedDirectedEdgeHandle],
         result: &mut Vec<(FixedVertexHandle, <V as HasPosition>::Scalar)>,
-    ) {
+    ) -> Result<(), InternalError> {
         result.clear();
 
-        if nns.is_empty() {
-            return;
-        }
+        let Some(last_nn) = nns.last() else {
+            return Ok(());
+        };
 
         if nns.len() == 1 {
             let edge = self.triangulation.directed_edge(nns[0]);
             result.push((edge.from().fix(), one()));
-            return;
+            return Ok(());
         }
 
         if nns.len() == 2 {
@@ -519,7 +547,7 @@ where
 
             result.push((v0.fix(), w0));
             result.push((v1.fix(), w1));
-            return;
+            return Ok(());
         }
 
         // Get insertion cell vertices. The "insertion cell" refers to the voronoi cell that would be
@@ -528,7 +556,12 @@ where
         // natural neighbors (e.g. [position, nn[2].position(), nn[3].position()]).
         //
         // `images/natural_neighbor_insertion_cell.svg` depicts the cell as thick orange line.
-        let mut insertion_cell = self.insert_cell_buffer.borrow_mut();
+        let mut fallback_buffer = Vec::new();
+        let mut borrowed_buffer = self.insert_cell_buffer.try_borrow_mut();
+        let insertion_cell = match &mut borrowed_buffer {
+            Ok(buffer) => &mut **buffer,
+            Err(_) => &mut fallback_buffer,
+        };
         insertion_cell.clear();
         for cur_nn in nns {
             let cur_nn = self.triangulation.directed_edge(*cur_nn);
@@ -546,8 +579,12 @@ where
 
         let mut total_area = zero(); // Used to normalize weights at the end
 
-        let mut last_edge = self.triangulation.directed_edge(*nns.last().unwrap());
-        let mut last = *insertion_cell.last().unwrap();
+        let mut last_edge = self.triangulation.directed_edge(*last_nn);
+        let Some(mut last) = insertion_cell.last().copied() else {
+            return Err(internal_error!(
+                "Insertion cell must not be empty. This is a bug."
+            ));
+        };
 
         for (stop_edge, first) in core::iter::zip(nns.iter(), &*insertion_cell) {
             // Main loop
@@ -569,7 +606,11 @@ where
 
             // `stop_edge` is used to know when to stop the inner loop (= once the polygon is finished)
             let stop_edge = self.triangulation.directed_edge(*stop_edge);
-            assert!(!stop_edge.is_outer_edge());
+            if stop_edge.is_outer_edge() {
+                return Err(internal_error!(
+                    "Natural neighbor edge must not be an outer edge. This is a bug."
+                ));
+            }
 
             let mut positive_area = first.x * last.y;
             let mut negative_area = first.y * last.x;
@@ -579,12 +620,12 @@ where
                 // out edge of the current natural neighbor.
                 //
                 // The natural_neighbor_polygon.svg refers to this variable as `c0`, `c1`, and `c2`.
-                let vertices = last_edge
-                    .face()
-                    .as_inner()
-                    .unwrap()
-                    .positions()
-                    .map(|p| p.sub(position));
+                let Some(face) = last_edge.face().as_inner() else {
+                    return Err(internal_error!(
+                        "Natural neighbor polygon must consist of inner faces. This is a bug."
+                    ));
+                };
+                let vertices = face.positions().map(|p| p.sub(position));
 
                 let current = math::circumcenter(vertices).0;
 
@@ -613,6 +654,7 @@ where
         for tuple in result {
             tuple.1 = tuple.1 / total_area;
         }
+        Ok(())
     }
 
     /// Estimates and returns the gradient for a every vertex in this triangulation.
@@ -706,13 +748,14 @@ fn get_natural_neighbor_edges<T>(
     inspect_buffer: &mut Vec<FixedDirectedEdgeHandle>,
     position: Point2<<T::Vertex as HasPosition>::Scalar>,
     result: &mut Vec<FixedDirectedEdgeHandle>,
-) where
+) -> Result<(), QueryError>
+where
     T: Triangulation,
     <T::Vertex as HasPosition>::Scalar: Float,
 {
     inspect_buffer.clear();
     result.clear();
-    match triangulation.locate(position) {
+    match triangulation.locate(position)? {
         PositionInTriangulation::OnFace(face) => {
             for edge in triangulation
                 .face(face)
@@ -729,7 +772,7 @@ fn get_natural_neighbor_edges<T>(
 
             if edge.is_part_of_convex_hull() {
                 result.extend([edge.fix(), edge.fix().rev()]);
-                return;
+                return Ok(());
             }
 
             for edge in [edge, edge.rev()] {
@@ -748,6 +791,7 @@ fn get_natural_neighbor_edges<T>(
         _ => {}
     }
     result.reverse();
+    Ok(())
 }
 
 /// Identifies natural neighbors.
@@ -851,7 +895,7 @@ mod test {
 
         let mut buffer = Vec::new();
         let query_point = Point2::new(0.5, 0.2);
-        super::get_natural_neighbor_edges(&t, &mut buffer, query_point, &mut nn_edges);
+        super::get_natural_neighbor_edges(&t, &mut buffer, query_point, &mut nn_edges).unwrap();
 
         assert!(nn_edges.len() >= 3);
 
@@ -863,7 +907,9 @@ mod test {
         let mut nns = Vec::new();
         let natural_neighbor = &t.natural_neighbor();
         for v in t.vertices() {
-            natural_neighbor.get_weights(v.position(), &mut nns);
+            natural_neighbor
+                .get_weights(v.position(), &mut nns)
+                .unwrap();
             let expected = vec![(v.fix(), 1.0f64)];
             assert_eq!(nns, expected);
         }
@@ -881,7 +927,8 @@ mod test {
 
         let mut result = Vec::new();
         t.natural_neighbor()
-            .get_weights(Point2::new(0.0, 0.0), &mut result);
+            .get_weights(Point2::new(0.0, 0.0), &mut result)
+            .unwrap();
 
         assert_eq!(result.len(), 3);
         let mut v1_weight = None;
@@ -916,7 +963,8 @@ mod test {
 
         let mut result = Vec::new();
         t.natural_neighbor()
-            .get_weights(Point2::new(0.0, 0.0), &mut result);
+            .get_weights(Point2::new(0.0, 0.0), &mut result)
+            .unwrap();
 
         assert_eq!(result.len(), 4);
         for (_, weight) in result {
@@ -936,7 +984,10 @@ mod test {
         }
 
         for v in random_points_in_range(1.5, 50, SEED2) {
-            let value = t.natural_neighbor().interpolate(|p| p.data().height, v);
+            let value = t
+                .natural_neighbor()
+                .interpolate(|p| p.data().height, v)
+                .unwrap();
             if let Some(value) = value {
                 assert_ulps_eq!(value, 1.5);
             }
@@ -974,6 +1025,7 @@ mod test {
             let value = t
                 .natural_neighbor()
                 .interpolate(|v| v.data().height, point)
+                .unwrap()
                 .unwrap();
             assert_ulps_eq!(value, expected, epsilon = 0.001);
         };
@@ -1002,6 +1054,7 @@ mod test {
             assert!(t
                 .natural_neighbor()
                 .interpolate(|v| v.data().height, point)
+                .unwrap()
                 .is_none());
         };
 
@@ -1033,6 +1086,7 @@ mod test {
             let value = t
                 .natural_neighbor()
                 .interpolate(|v| v.data().height, point)
+                .unwrap()
                 .unwrap();
             let r2 = point.length2();
             assert_ulps_eq!(value, r2, epsilon = 0.001);
@@ -1091,6 +1145,7 @@ mod test {
         let nns = delaunay.natural_neighbor();
         let result: f64 = nns
             .interpolate(|_| 1.0, Point2::new(2273118.2, 6205168.666666667))
+            .unwrap()
             .unwrap();
 
         assert!(!result.is_nan());
@@ -1113,6 +1168,7 @@ mod test {
         let v = nn
             .triangulation
             .locate_vertex(Point2::new(0.5, 0.5))
+            .unwrap()
             .unwrap();
 
         let grad = nn.estimate_gradient(v, |v| v.data().height);
@@ -1138,6 +1194,7 @@ mod test {
         let v = nn
             .triangulation
             .locate_vertex(Point2::new(0.5, 0.5))
+            .unwrap()
             .unwrap();
 
         let grad = nn.estimate_gradient(v, |v| v.data().height);
